@@ -441,21 +441,23 @@ async def handle_health(request):
     return web.json_response(status, headers=CORS_HEADERS)
 
 
-# ==================== YÖNETİCİ PANELİ (İZLEYİCİ SAYACLI) ====================
+# ==================== YÖNETİCİ PANELİ ====================
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IPTV Kontrol & Canlı İzleyici Paneli</title>
+    <title>IPTV Yönetim Paneli</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; max-width: 650px; margin: auto; }
         .card { background: #1e293b; padding: 15px; border-radius: 12px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
         .stats-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 15px; }
         .stat-box { background: #334155; padding: 12px; border-radius: 8px; text-align: center; }
-        .stat-val { font-size: 20px; font-weight: bold; color: #38bdf8; }
+        .stat-val { font-size: 19px; font-weight: bold; color: #38bdf8; }
         .stat-lbl { font-size: 11px; color: #94a3b8; margin-top: 4px; }
+        .progress-container { background: #334155; border-radius: 6px; height: 10px; width: 100%; margin-top: 8px; overflow: hidden; }
+        .progress-bar { background: #38bdf8; height: 100%; width: 0%; transition: width 0.4s; }
         h2 { color: #38bdf8; margin-top: 0; }
         .btn { padding: 10px 18px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; color: white; transition: 0.2s; }
         .btn-on { background: #22c55e; }
@@ -468,7 +470,7 @@ ADMIN_HTML = """
     </style>
 </head>
 <body>
-    <h2>📊 Sunucu & İzleyici Durumu</h2>
+    <h2>📊 Aylık Durum & Kota Takibi</h2>
     <div class="stats-grid">
         <div class="stat-box">
             <div class="stat-val" id="totalViewers" style="color:#a855f7;">0</div>
@@ -476,11 +478,21 @@ ADMIN_HTML = """
         </div>
         <div class="stat-box">
             <div class="stat-val" id="servedGb">0.00 GB</div>
-            <div class="stat-lbl">Harcanan Kota</div>
+            <div class="stat-lbl" id="monthLabel">Bu Ay Harcanan</div>
         </div>
         <div class="stat-box">
             <div class="stat-val" id="ramMb">0 MB</div>
             <div class="stat-lbl">RAM Kullanımı</div>
+        </div>
+    </div>
+
+    <div class="card" style="padding:12px;">
+        <div style="display:flex; justify-content:space-between; font-size:12px; color:#cbd5e1;">
+            <span>Aylık Kota Doluluğu (100 GB)</span>
+            <span id="percentText">%0.0</span>
+        </div>
+        <div class="progress-container">
+            <div class="progress-bar" id="progressBar"></div>
         </div>
     </div>
 
@@ -489,7 +501,7 @@ ADMIN_HTML = """
         <input type="password" id="adminKey" value="admin123">
     </div>
 
-    <h2>📺 Yayın Kontrolü</h2>
+    <h2>📺 Kanal Kontrolleri</h2>
     <div id="channels"></div>
 
     <script>
@@ -498,10 +510,22 @@ ADMIN_HTML = """
                 const res = await fetch('/health');
                 const data = await res.json();
                 
-                // İstatistikleri güncelle
                 document.getElementById('totalViewers').innerText = data.server.total_viewers + " Kişi";
-                document.getElementById('servedGb').innerText = data.server.total_served_gb + " GB";
+                document.getElementById('servedGb').innerText = data.server.monthly_served_gb + " GB";
+                document.getElementById('monthLabel').innerText = "Bu Ay (" + data.server.month + ")";
                 document.getElementById('ramMb').innerText = data.server.ram_usage_mb + " MB";
+
+                const pct = Math.min(100, data.server.quota_percent);
+                document.getElementById('percentText').innerText = "%" + pct + " (" + data.server.monthly_served_gb + " / 100 GB)";
+                const bar = document.getElementById('progressBar');
+                bar.style.width = pct + "%";
+                if(pct > 85) {
+                    bar.style.background = "#ef4444";
+                } else if(pct > 60) {
+                    bar.style.background = "#eab308";
+                } else {
+                    bar.style.background = "#38bdf8";
+                }
 
                 const container = document.getElementById('channels');
                 container.innerHTML = '';
@@ -569,6 +593,7 @@ async def handle_admin_toggle(request):
     if not enable:
         await st.stop()
     return web.json_response({"success": True, "id": cid, "enabled": st.enabled})
+
 
 
 # ==================== APP ====================
