@@ -11,7 +11,6 @@ from aiohttp import web, ClientSession, ClientTimeout
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 LOCAL_HOST = "0.0.0.0"
-# Render'ın atadığı portu otomatik okur, bulamazsa 8088 kullanır
 PROXY_PORT = int(os.environ.get("PORT", 8088))
 
 KANALLAR = {
@@ -40,6 +39,13 @@ async def cleanup_cache():
         expired_keys = [k for k, v in TS_CACHE.items() if now - v[1] > 30]
         for k in expired_keys:
             del TS_CACHE[k]
+
+async def start_background_tasks(app):
+    app['cleanup_task'] = asyncio.create_task(cleanup_cache())
+
+async def cleanup_background_tasks(app):
+    app['cleanup_task'].cancel()
+    await app['cleanup_task']
 
 async def fetch_ts_segment(session, url):
     if url in TS_CACHE:
@@ -118,11 +124,11 @@ def make_app():
     app = web.Application()
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
     app.router.add_get("/ts_proxy", handle_ts_proxy)
+    app.on_startup.append(start_background_tasks)
+    app.on_cleanup.append(cleanup_background_tasks)
     return app
 
 if __name__ == "__main__":
     app = make_app()
-    loop = asyncio.get_event_loop()
-    loop.create_task(cleanup_cache())
     logging.info(f"[*] Single-Source Stream Caching Proxy Başlatıldı: Port {PROXY_PORT}")
     web.run_app(app, host=LOCAL_HOST, port=PROXY_PORT)
