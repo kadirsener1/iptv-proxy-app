@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FFmpeg tabanlı HLS re-stream proxy (Canlı İzleyici Sayacı & Kota Takibi).
+FFmpeg tabanlı HLS re-stream proxy (Kalıcı Aylık Kota & İzleyici Sayacı).
 """
 
 import os
@@ -24,19 +24,17 @@ BASE_DIR = Path(__file__).resolve().parent
 LOCAL_M3U_PATH  = os.environ.get("LOCAL_M3U_PATH", str(BASE_DIR / "playlist.m3u"))
 LOCAL_JSON_PATH = os.environ.get("LOCAL_JSON_PATH", str(BASE_DIR / "channels.json"))
 LOG_DIR         = os.environ.get("LOG_DIR", str(BASE_DIR / "logs"))
+USAGE_FILE      = os.environ.get("USAGE_FILE", str(BASE_DIR / "bandwidth_usage.json"))
 
 HLS_BASE_DIR = "/tmp/iptv_hls"
 STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 
-HLS_TIME       = 4
+HLS_TIME       = 5
 HLS_LIST_SIZE  = 12
 IDLE_TIMEOUT   = 100
 STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
 APP_START_TIME = time.time()
-
-# Toplam harcanan veri (Bayt)
-TOTAL_BYTES_SERVED = 0
 
 # ==================== KANALLAR ====================
 KANALLAR = [
@@ -78,8 +76,70 @@ logging.basicConfig(
 log = logging.getLogger("iptv")
 
 
+# ==================== KALICI AYLIK KOTA TAKİPÇİSİ ====================
+class BandwidthTracker:
+    """Kotayı diske kaydeder ve her ay başında otomatik olarak sıfırlar."""
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.current_month = time.strftime("%Y-%m")
+        self.bytes_used = 0
+        self.dirty = False
+        self.load()
+
+    def load(self):
+        now_month = time.strftime("%Y-%m")
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if data.get("month") == now_month:
+                        self.bytes_used = data.get("bytes", 0)
+                        self.current_month = now_month
+                    else:
+                        # Ay değişmiş! Yeni ay için sıfırla
+                        self.bytes_used = 0
+                        self.current_month = now_month
+                        self.save()
+            except Exception:
+                self.bytes_used = 0
+        else:
+            self.bytes_used = 0
+            self.current_month = now_month
+            self.save()
+
+    def add_bytes(self, n: int):
+        now_month = time.strftime("%Y-%m")
+        if now_month != self.current_month:
+            self.current_month = now_month
+            self.bytes_used = 0
+
+        self.bytes_used += n
+        self.dirty = True
+
+    def save(self):
+        try:
+            data = {
+                "month": self.current_month,
+                "bytes": self.bytes_used,
+                "last_updated": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            with open(self.filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self.dirty = False
+        except Exception as e:
+            log.warning(f"Kota kaydedilemedi: {e}")
+
+    async def periodic_save(self):
+        """Diski yormamak için her 10 saniyede bir kaydeder"""
+        while True:
+            await asyncio.sleep(10)
+            if self.dirty:
+                self.save()
+
+tracker = BandwidthTracker(USAGE_FILE)
+
+
 def get_client_ip(request):
-    """Kullanıcının gerçek IP adresini tespit eder (Cloudflare/Render Proxy Uyumlu)"""
     xff = request.headers.get("X-Forwarded-For")
     if xff:
         return xff.split(",")[0].strip()
@@ -131,19 +191,16 @@ class ChannelStream:
         self.lock = asyncio.Lock()
         self.started_at = 0.0
         self.enabled = True
-        self.viewers = {}  # {ip_adresi: son_istek_zamani}
+        self.viewers = {}
 
     def record_viewer(self, ip: str):
-        """İzleyicinin IP'sini kaydeder/günceller"""
         if ip and ip != "unknown":
             self.viewers[ip] = time.time()
             self.touch()
 
     def get_viewer_count(self) -> int:
-        """Son 12 saniye içinde istek atan benzersiz kullanıcı sayısı"""
         now = time.time()
         active = [ip for ip, last_seen in self.viewers.items() if (now - last_seen) <= 12]
-        # Eski IP'leri temizle
         self.viewers = {ip: last_seen for ip, last_seen in self.viewers.items() if (now - last_seen) <= 60}
         return len(active)
 
@@ -261,7 +318,6 @@ manager = StreamManager()
 
 # ==================== HTTP HANDLER'LAR ====================
 async def handle_m3u8(request):
-    global TOTAL_BYTES_SERVED
     cid = request.match_info.get("channel_id")
     st = manager.get(cid)
     if not st:
@@ -284,7 +340,7 @@ async def handle_m3u8(request):
             f"#EXTINF:{HLS_TIME}.000,", f"{dynamic_proxy_url}/hls/standby/seg.ts?seq={seq + 2}",
         ]
         resp_text = "\n".join(standby_lines)
-        TOTAL_BYTES_SERVED += len(resp_text.encode('utf-8'))
+        tracker.add_bytes(len(resp_text.encode('utf-8')))
         return web.Response(text=resp_text, content_type="application/vnd.apple.mpegurl", headers={**CORS_HEADERS, "Cache-Control": "no-cache"})
 
     res = await manager.ensure_running(cid)
@@ -311,12 +367,11 @@ async def handle_m3u8(request):
             out_lines.append(f"{dynamic_proxy_url}/hls/{cid}/{seg_name}")
 
     resp_text = "\n".join(out_lines)
-    TOTAL_BYTES_SERVED += len(resp_text.encode('utf-8'))
+    tracker.add_bytes(len(resp_text.encode('utf-8')))
     return web.Response(text=resp_text, content_type="application/vnd.apple.mpegurl", headers={**CORS_HEADERS, "Cache-Control": "no-cache"})
 
 
 async def handle_segment(request):
-    global TOTAL_BYTES_SERVED
     cid = request.match_info.get("channel_id")
     name = request.match_info.get("name")
 
@@ -338,31 +393,36 @@ async def handle_segment(request):
 
     try:
         file_size = os.path.getsize(seg_path)
-        TOTAL_BYTES_SERVED += file_size
+        tracker.add_bytes(file_size)
         return web.FileResponse(seg_path, headers={**CORS_HEADERS, "Cache-Control": "public, max-age=6", "Content-Type": "video/mp2t"})
     except Exception as e:
         return web.Response(status=500, text=str(e), headers=CORS_HEADERS)
 
 
 async def handle_standby_segment(request):
-    global TOTAL_BYTES_SERVED
     if not os.path.exists(STANDBY_TS_PATH):
         generate_standby_clip()
     if not os.path.exists(STANDBY_TS_PATH):
         return web.Response(status=404, headers=CORS_HEADERS)
 
     file_size = os.path.getsize(STANDBY_TS_PATH)
-    TOTAL_BYTES_SERVED += file_size
+    tracker.add_bytes(file_size)
     return web.FileResponse(STANDBY_TS_PATH, headers={**CORS_HEADERS, "Cache-Control": "public, max-age=4", "Content-Type": "video/mp2t"})
 
 
 async def handle_health(request):
+    used_mb = round(tracker.bytes_used / (1024 * 1024), 2)
+    used_gb = round(tracker.bytes_used / (1024 * 1024 * 1024), 3)
+    percent = round((tracker.bytes_used / (100 * 1024 * 1024 * 1024)) * 100, 2)
+
     status = {
         "server": {
+            "month": tracker.current_month,
             "uptime_seconds": int(time.time() - APP_START_TIME),
             "ram_usage_mb": get_memory_usage_mb(),
-            "total_served_mb": round(TOTAL_BYTES_SERVED / (1024 * 1024), 2),
-            "total_served_gb": round(TOTAL_BYTES_SERVED / (1024 * 1024 * 1024), 3),
+            "monthly_served_mb": used_mb,
+            "monthly_served_gb": used_gb,
+            "quota_percent": percent,
             "total_viewers": manager.total_viewers()
         },
         "channels": {}
@@ -377,21 +437,23 @@ async def handle_health(request):
     return web.json_response(status, headers=CORS_HEADERS)
 
 
-# ==================== YÖNETİCİ PANELİ (İZLEYİCİ SAYACLI) ====================
+# ==================== YÖNETİCİ PANELİ (GELİŞMİŞ GÖSTERGELİ) ====================
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IPTV Kontrol & Canlı İzleyici Paneli</title>
+    <title>IPTV Yönetim Paneli</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; max-width: 650px; margin: auto; }
         .card { background: #1e293b; padding: 15px; border-radius: 12px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
         .stats-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 15px; }
         .stat-box { background: #334155; padding: 12px; border-radius: 8px; text-align: center; }
-        .stat-val { font-size: 20px; font-weight: bold; color: #38bdf8; }
+        .stat-val { font-size: 19px; font-weight: bold; color: #38bdf8; }
         .stat-lbl { font-size: 11px; color: #94a3b8; margin-top: 4px; }
+        .progress-container { background: #334155; border-radius: 6px; height: 10px; width: 100%; margin-top: 8px; overflow: hidden; }
+        .progress-bar { background: #38bdf8; height: 100%; width: 0%; transition: width 0.4s; }
         h2 { color: #38bdf8; margin-top: 0; }
         .btn { padding: 10px 18px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; color: white; transition: 0.2s; }
         .btn-on { background: #22c55e; }
@@ -404,7 +466,7 @@ ADMIN_HTML = """
     </style>
 </head>
 <body>
-    <h2>📊 Sunucu & İzleyici Durumu</h2>
+    <h2>📊 Aylık Durum & Kota Takibi</h2>
     <div class="stats-grid">
         <div class="stat-box">
             <div class="stat-val" id="totalViewers" style="color:#a855f7;">0</div>
@@ -412,11 +474,22 @@ ADMIN_HTML = """
         </div>
         <div class="stat-box">
             <div class="stat-val" id="servedGb">0.00 GB</div>
-            <div class="stat-lbl">Harcanan Kota</div>
+            <div class="stat-lbl" id="monthLabel">Bu Ay Harcanan</div>
         </div>
         <div class="stat-box">
             <div class="stat-val" id="ramMb">0 MB</div>
             <div class="stat-lbl">RAM Kullanımı</div>
+        </div>
+    </div>
+
+    <!-- 100 GB KOTA ÇUBUĞU -->
+    <div class="card" style="padding:12px;">
+        <div style="display:flex; justify-content:space-between; font-size:12px; color:#cbd5e1;">
+            <span>Aylık Kota Doluluğu (100 GB)</span>
+            <span id="percentText">%0.0</span>
+        </div>
+        <div class="progress-container">
+            <div class="progress-bar" id="progressBar"></div>
         </div>
     </div>
 
@@ -425,7 +498,7 @@ ADMIN_HTML = """
         <input type="password" id="adminKey" value="admin123">
     </div>
 
-    <h2>📺 Yayın Kontrolü</h2>
+    <h2>📺 Kanal Kontrolleri</h2>
     <div id="channels"></div>
 
     <script>
@@ -434,10 +507,22 @@ ADMIN_HTML = """
                 const res = await fetch('/health');
                 const data = await res.json();
                 
-                // İstatistikleri güncelle
                 document.getElementById('totalViewers').innerText = data.server.total_viewers + " Kişi";
-                document.getElementById('servedGb').innerText = data.server.total_served_gb + " GB";
+                document.getElementById('servedGb').innerText = data.server.monthly_served_gb + " GB";
+                document.getElementById('monthLabel').innerText = "Bu Ay (" + data.server.month + ")";
                 document.getElementById('ramMb').innerText = data.server.ram_usage_mb + " MB";
+
+                const pct = Math.min(100, data.server.quota_percent);
+                document.getElementById('percentText').innerText = "%" + pct + " (" + data.server.monthly_served_gb + " / 100 GB)";
+                const bar = document.getElementById('progressBar');
+                bar.style.width = pct + "%";
+                if(pct > 85) {
+                    bar.style.background = "#ef4444"; // Tehlike kırmızı
+                } else if(pct > 60) {
+                    bar.style.background = "#eab308"; // Uyarı sarı
+                } else {
+                    bar.style.background = "#38bdf8"; // Normal mavi
+                }
 
                 const container = document.getElementById('channels');
                 container.innerHTML = '';
@@ -512,14 +597,17 @@ async def on_startup(app):
     os.makedirs(HLS_BASE_DIR, exist_ok=True)
     generate_standby_clip()
     app["monitor_task"] = asyncio.create_task(manager.monitor())
+    app["save_task"] = asyncio.create_task(tracker.periodic_save())
     log.info("IPTV HLS Re-stream Proxy başlatıldı.")
 
 async def on_cleanup(app):
+    tracker.save()
     for st in manager.streams.values():
         await st.stop()
-    t = app.get("monitor_task")
-    if t:
-        t.cancel()
+    for task_name in ["monitor_task", "save_task"]:
+        t = app.get(task_name)
+        if t:
+            t.cancel()
 
 def make_app():
     app = web.Application()
