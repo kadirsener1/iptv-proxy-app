@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FFmpeg tabanlı HLS re-stream proxy (Canlı İzleyici Sayacı & Kota Takibi).
+FFmpeg tabanlı HLS re-stream proxy.
+- Yayın kapalıyken doğrudan sıfır kotalı DÜZ METİN döner.
+- Kalıcı aylık kota ve canlı izleyici sayacı aktiftir.
+- Akıcı ve donmasız -c copy HLS remux yapısı.
 """
 
 import os
@@ -27,17 +30,13 @@ LOG_DIR         = os.environ.get("LOG_DIR", str(BASE_DIR / "logs"))
 USAGE_FILE      = os.environ.get("USAGE_FILE", str(BASE_DIR / "bandwidth_usage.json"))
 
 HLS_BASE_DIR = "/tmp/iptv_hls"
-STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 
-HLS_TIME       = 4
-HLS_LIST_SIZE  = 12
-IDLE_TIMEOUT   = 100
-STARTUP_WAIT   = 60
+HLS_TIME       = 4         # Segment süresi (sn)
+HLS_LIST_SIZE  = 12        # m3u8 buffer boyutu (donmaları önler)
+IDLE_TIMEOUT   = 100       # İzleyici yoksa FFmpeg'i kapat (sn)
+STARTUP_WAIT   = 60        # Max başlama süresi
 FFMPEG_BIN     = "ffmpeg"
 APP_START_TIME = time.time()
-
-# Toplam harcanan veri (Bayt)
-TOTAL_BYTES_SERVED = 0
 
 # ==================== KANALLAR ====================
 KANALLAR = [
@@ -81,7 +80,6 @@ log = logging.getLogger("iptv")
 
 # ==================== KALICI AYLIK KOTA TAKİPÇİSİ ====================
 class BandwidthTracker:
-    """Kotayı diske kaydeder ve her ay başında otomatik olarak sıfırlar."""
     def __init__(self, filepath):
         self.filepath = filepath
         self.current_month = time.strftime("%Y-%m")
@@ -99,7 +97,6 @@ class BandwidthTracker:
                         self.bytes_used = data.get("bytes", 0)
                         self.current_month = now_month
                     else:
-                        # Ay değişmiş! Yeni ay için sıfırla
                         self.bytes_used = 0
                         self.current_month = now_month
                         self.save()
@@ -133,7 +130,6 @@ class BandwidthTracker:
             log.warning(f"Kota kaydedilemedi: {e}")
 
     async def periodic_save(self):
-        """Diski yormamak için her 10 saniyede bir kaydeder"""
         while True:
             await asyncio.sleep(10)
             if self.dirty:
@@ -161,28 +157,6 @@ def get_memory_usage_mb():
         return 0.0
 
 
-
-# ==================== STANDBY EKRANI ====================
-def generate_standby_clip():
-    if os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
-        return
-    os.makedirs(HLS_BASE_DIR, exist_ok=True)
-    cmd = [
-        FFMPEG_BIN, "-y",
-        "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={HLS_TIME}:r=25",
-        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
-        "-t", str(HLS_TIME),
-        "-vf", "drawtext=text='YAYIN SU ANDA KAPALIDIR. Mac Saatinde Acilacaktir':fontcolor=white:fontsize=44:x=(w-text_w)/2:y=(h-text_h)/2",
-        "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-b:v", "35k",
-        "-c:a", "aac", "-b:a", "16k",
-        "-f", "mpegts", STANDBY_TS_PATH
-    ]
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-    except Exception as e:
-        log.warning(f"Standby klibi oluşturulamadı: {e}")
-
-
 # ==================== FFMPEG YÖNETİCİSİ ====================
 class ChannelStream:
     def __init__(self, channel: dict):
@@ -195,19 +169,16 @@ class ChannelStream:
         self.lock = asyncio.Lock()
         self.started_at = 0.0
         self.enabled = True
-        self.viewers = {}  # {ip_adresi: son_istek_zamani}
+        self.viewers = {}
 
     def record_viewer(self, ip: str):
-        """İzleyicinin IP'sini kaydeder/günceller"""
         if ip and ip != "unknown":
             self.viewers[ip] = time.time()
             self.touch()
 
     def get_viewer_count(self) -> int:
-        """Son 12 saniye içinde istek atan benzersiz kullanıcı sayısı"""
         now = time.time()
         active = [ip for ip, last_seen in self.viewers.items() if (now - last_seen) <= 12]
-        # Eski IP'leri temizle
         self.viewers = {ip: last_seen for ip, last_seen in self.viewers.items() if (now - last_seen) <= 60}
         return len(active)
 
@@ -221,14 +192,25 @@ class ChannelStream:
         seg_pattern = os.path.join(self.dir, "seg_%05d.ts")
 
         cmd = [
-            FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-nostdin",
-            "-rw_timeout", "15000000", "-reconnect", "1", "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5", "-user_agent", "VLC/3.0.18 LibVLC/3.0.18",
-            "-i", self.src, "-c", "copy", "-f", "hls",
-            "-hls_time", str(HLS_TIME), "-hls_list_size", str(HLS_LIST_SIZE),
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-nostdin",
+            "-rw_timeout", "15000000",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-user_agent", "VLC/3.0.18 LibVLC/3.0.18",
+            "-i", self.src,
+            "-c", "copy",
+            "-f", "hls",
+            "-hls_time", str(HLS_TIME),
+            "-hls_list_size", str(HLS_LIST_SIZE),
             "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
-            "-hls_segment_type", "mpegts", "-hls_segment_filename", seg_pattern,
-            "-hls_allow_cache", "1", m3u8_path
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", seg_pattern,
+            "-hls_allow_cache", "1",
+            m3u8_path
         ]
         return cmd
 
@@ -241,6 +223,7 @@ class ChannelStream:
             self._prepare_dir()
             cmd = self._build_cmd()
             ff_log = open(os.path.join(LOG_DIR, f"{self.id}.ffmpeg.log"), "ab")
+            log.info(f"[{self.id}] FFmpeg başlatılıyor...")
             self.proc = subprocess.Popen(cmd, stdout=ff_log, stderr=ff_log, stdin=subprocess.DEVNULL, start_new_session=True)
             self.started_at = time.time()
 
@@ -249,6 +232,7 @@ class ChannelStream:
             if not self.proc:
                 return
             if self.proc.poll() is None:
+                log.info(f"[{self.id}] FFmpeg durduruldu.")
                 try:
                     self.proc.terminate()
                     try:
@@ -325,31 +309,23 @@ manager = StreamManager()
 
 # ==================== HTTP HANDLER'LAR ====================
 async def handle_m3u8(request):
-    global TOTAL_BYTES_SERVED
     cid = request.match_info.get("channel_id")
     st = manager.get(cid)
     if not st:
         return web.Response(status=404, text="Kanal Yok", headers=CORS_HEADERS)
 
+    # --- KANAL KAPALIYSA: KOTA HARCAMAYAN SAF METİN DÖN ---
+    if not st.enabled:
+        return web.Response(
+            status=403,
+            text="YAYIN SU ANDA KAPALIDIR\nMac saatinde acilacaktir.",
+            content_type="text/plain; charset=utf-8",
+            headers=CORS_HEADERS
+        )
+
+    # --- KANAL AÇIKSA: CANLI YAYINI İŞLE ---
     client_ip = get_client_ip(request)
     st.record_viewer(client_ip)
-
-    scheme = request.headers.get("X-Forwarded-Proto", request.url.scheme)
-    host = request.headers.get("X-Forwarded-Host", request.host)
-    dynamic_proxy_url = f"{scheme}://{host}"
-
-    if not st.enabled:
-        seq = int(time.time() // HLS_TIME)
-        standby_lines = [
-            "#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{HLS_TIME}",
-            f"#EXT-X-MEDIA-SEQUENCE:{seq}",
-            f"#EXTINF:{HLS_TIME}.000,", f"{dynamic_proxy_url}/hls/standby/seg.ts?seq={seq}",
-            f"#EXTINF:{HLS_TIME}.000,", f"{dynamic_proxy_url}/hls/standby/seg.ts?seq={seq + 1}",
-            f"#EXTINF:{HLS_TIME}.000,", f"{dynamic_proxy_url}/hls/standby/seg.ts?seq={seq + 2}",
-        ]
-        resp_text = "\n".join(standby_lines)
-        TOTAL_BYTES_SERVED += len(resp_text.encode('utf-8'))
-        return web.Response(text=resp_text, content_type="application/vnd.apple.mpegurl", headers={**CORS_HEADERS, "Cache-Control": "no-cache"})
 
     res = await manager.ensure_running(cid)
     if not res:
@@ -365,6 +341,10 @@ async def handle_m3u8(request):
     except Exception as e:
         return web.Response(status=500, text=str(e), headers=CORS_HEADERS)
 
+    scheme = request.headers.get("X-Forwarded-Proto", request.url.scheme)
+    host = request.headers.get("X-Forwarded-Host", request.host)
+    dynamic_proxy_url = f"{scheme}://{host}"
+
     out_lines = []
     for line in content.splitlines():
         s = line.strip()
@@ -375,12 +355,11 @@ async def handle_m3u8(request):
             out_lines.append(f"{dynamic_proxy_url}/hls/{cid}/{seg_name}")
 
     resp_text = "\n".join(out_lines)
-    TOTAL_BYTES_SERVED += len(resp_text.encode('utf-8'))
+    tracker.add_bytes(len(resp_text.encode('utf-8')))
     return web.Response(text=resp_text, content_type="application/vnd.apple.mpegurl", headers={**CORS_HEADERS, "Cache-Control": "no-cache"})
 
 
 async def handle_segment(request):
-    global TOTAL_BYTES_SERVED
     cid = request.match_info.get("channel_id")
     name = request.match_info.get("name")
 
@@ -388,8 +367,8 @@ async def handle_segment(request):
         return web.Response(status=400, headers=CORS_HEADERS)
 
     st = manager.get(cid)
-    if not st:
-        return web.Response(status=404, headers=CORS_HEADERS)
+    if not st or not st.enabled:
+        return web.Response(status=403, text="Kanal Kapalı", headers=CORS_HEADERS)
 
     client_ip = get_client_ip(request)
     st.record_viewer(client_ip)
@@ -402,31 +381,25 @@ async def handle_segment(request):
 
     try:
         file_size = os.path.getsize(seg_path)
-        TOTAL_BYTES_SERVED += file_size
+        tracker.add_bytes(file_size)
         return web.FileResponse(seg_path, headers={**CORS_HEADERS, "Cache-Control": "public, max-age=6", "Content-Type": "video/mp2t"})
     except Exception as e:
         return web.Response(status=500, text=str(e), headers=CORS_HEADERS)
 
 
-async def handle_standby_segment(request):
-    global TOTAL_BYTES_SERVED
-    if not os.path.exists(STANDBY_TS_PATH):
-        generate_standby_clip()
-    if not os.path.exists(STANDBY_TS_PATH):
-        return web.Response(status=404, headers=CORS_HEADERS)
-
-    file_size = os.path.getsize(STANDBY_TS_PATH)
-    TOTAL_BYTES_SERVED += file_size
-    return web.FileResponse(STANDBY_TS_PATH, headers={**CORS_HEADERS, "Cache-Control": "public, max-age=4", "Content-Type": "video/mp2t"})
-
-
 async def handle_health(request):
+    used_mb = round(tracker.bytes_used / (1024 * 1024), 2)
+    used_gb = round(tracker.bytes_used / (1024 * 1024 * 1024), 3)
+    percent = round((tracker.bytes_used / (100 * 1024 * 1024 * 1024)) * 100, 2)
+
     status = {
         "server": {
+            "month": tracker.current_month,
             "uptime_seconds": int(time.time() - APP_START_TIME),
             "ram_usage_mb": get_memory_usage_mb(),
-            "total_served_mb": round(TOTAL_BYTES_SERVED / (1024 * 1024), 2),
-            "total_served_gb": round(TOTAL_BYTES_SERVED / (1024 * 1024 * 1024), 3),
+            "monthly_served_mb": used_mb,
+            "monthly_served_gb": used_gb,
+            "quota_percent": percent,
             "total_viewers": manager.total_viewers()
         },
         "channels": {}
@@ -598,16 +571,18 @@ async def handle_admin_toggle(request):
 # ==================== APP ====================
 async def on_startup(app):
     os.makedirs(HLS_BASE_DIR, exist_ok=True)
-    generate_standby_clip()
     app["monitor_task"] = asyncio.create_task(manager.monitor())
+    app["save_task"] = asyncio.create_task(tracker.periodic_save())
     log.info("IPTV HLS Re-stream Proxy başlatıldı.")
 
 async def on_cleanup(app):
+    tracker.save()
     for st in manager.streams.values():
         await st.stop()
-    t = app.get("monitor_task")
-    if t:
-        t.cancel()
+    for task_name in ["monitor_task", "save_task"]:
+        t = app.get(task_name)
+        if t:
+            t.cancel()
 
 def make_app():
     app = web.Application()
@@ -616,7 +591,6 @@ def make_app():
     app.router.add_get("/admin", handle_admin_page)
     app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
-    app.router.add_get("/hls/standby/seg.ts", handle_standby_segment)
     app.router.add_get("/hls/{channel_id}/{name}", handle_segment)
     
     app.on_startup.append(on_startup)
