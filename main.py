@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FFmpeg tabanlı HLS re-stream proxy (Kalıcı Aylık Kota & İzleyici Sayacı & Akıllı Standby Ekranı).
-- Yayın kapatıldığında yedek korumalı 'YAYIN KAPALIDIR' video döngüsü döner.
-- Kalıcı aylık kota takibi ve anlık izleyici sayaçları tam performans çalışır.
+FFmpeg tabanlı HLS re-stream proxy.
+- Yayın kapalıyken doğrudan sıfır kotalı DÜZ METİN döner.
+- Kalıcı aylık kota ve canlı izleyici sayacı aktiftir.
+- Akıcı ve donmasız -c copy HLS remux yapısı.
 """
 
 import os
@@ -29,12 +30,11 @@ LOG_DIR         = os.environ.get("LOG_DIR", str(BASE_DIR / "logs"))
 USAGE_FILE      = os.environ.get("USAGE_FILE", str(BASE_DIR / "bandwidth_usage.json"))
 
 HLS_BASE_DIR = "/tmp/iptv_hls"
-STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 
-HLS_TIME       = 4
-HLS_LIST_SIZE  = 12
-IDLE_TIMEOUT   = 100
-STARTUP_WAIT   = 60
+HLS_TIME       = 4         # Segment süresi (sn)
+HLS_LIST_SIZE  = 12        # m3u8 buffer boyutu (donmaları önler)
+IDLE_TIMEOUT   = 100       # İzleyici yoksa FFmpeg'i kapat (sn)
+STARTUP_WAIT   = 60        # Max başlama süresi
 FFMPEG_BIN     = "ffmpeg"
 APP_START_TIME = time.time()
 
@@ -157,52 +157,6 @@ def get_memory_usage_mb():
         return 0.0
 
 
-# ==================== STANDBY EKRANI OLUŞTURUCU (KORUMALI) ====================
-def generate_standby_clip():
-    """1 kereliğine mikro boyutlu 'Yayın Kapalıdır' video segmenti üretir. Font hatası alırsa yedek ekranı devreye sokar."""
-    if os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
-        return
-
-    os.makedirs(HLS_BASE_DIR, exist_ok=True)
-    log.info("Standby (Yayın Kapalı) ekranı oluşturma denemesi başlatıldı...")
-
-    # YÖNTEM 1: Yazılı siyah ekran oluşturma
-    cmd_text = [
-        FFMPEG_BIN, "-y",
-        "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={HLS_TIME}:r=25",
-        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
-        "-t", str(HLS_TIME),
-        "-vf", "drawtext=text='YAYIN SU ANDA KAPALIDIR\\n\\nMac Saatinde Acilacaktir':fontcolor=white:fontsize=44:x=(w-text_w)/2:y=(h-text_h)/2",
-        "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-b:v", "35k",
-        "-c:a", "aac", "-b:a", "16k",
-        "-f", "mpegts", STANDBY_TS_PATH
-    ]
-    try:
-        res = subprocess.run(cmd_text, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
-        if res.returncode == 0 and os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
-            log.info("Yazılı standby ekranı başarıyla oluşturuldu.")
-            return
-    except Exception as e:
-        log.warning(f"Yazılı standby ekranı oluşturma hatası: {e}")
-
-    # YÖNTEM 2 (YEDEK): Font eksikliğinde hata vermemesi için renkli test ekranı (SMPTE colorbars)
-    log.warning("Yazılı ekran oluşturulamadı, sisteme özel yedek test ekranı (Colorbars) aktif ediliyor...")
-    cmd_fallback = [
-        FFMPEG_BIN, "-y",
-        "-f", "lavfi", "-i", f"smptebars=size=1280x720:d={HLS_TIME}:r=25",
-        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
-        "-t", str(HLS_TIME),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-b:v", "30k",
-        "-c:a", "aac", "-b:a", "16k",
-        "-f", "mpegts", STANDBY_TS_PATH
-    ]
-    try:
-        subprocess.run(cmd_fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-        log.info("Yedek Standby ekranı başarıyla oluşturuldu.")
-    except Exception as e:
-        log.error(f"Yedek standby ekranı da oluşturulamadı: {e}")
-
-
 # ==================== FFMPEG YÖNETİCİSİ ====================
 class ChannelStream:
     def __init__(self, channel: dict):
@@ -238,14 +192,25 @@ class ChannelStream:
         seg_pattern = os.path.join(self.dir, "seg_%05d.ts")
 
         cmd = [
-            FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-nostdin",
-            "-rw_timeout", "15000000", "-reconnect", "1", "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5", "-user_agent", "VLC/3.0.18 LibVLC/3.0.18",
-            "-i", self.src, "-c", "copy", "-f", "hls",
-            "-hls_time", str(HLS_TIME), "-hls_list_size", str(HLS_LIST_SIZE),
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-nostdin",
+            "-rw_timeout", "15000000",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-user_agent", "VLC/3.0.18 LibVLC/3.0.18",
+            "-i", self.src,
+            "-c", "copy",
+            "-f", "hls",
+            "-hls_time", str(HLS_TIME),
+            "-hls_list_size", str(HLS_LIST_SIZE),
             "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
-            "-hls_segment_type", "mpegts", "-hls_segment_filename", seg_pattern,
-            "-hls_allow_cache", "1", m3u8_path
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", seg_pattern,
+            "-hls_allow_cache", "1",
+            m3u8_path
         ]
         return cmd
 
@@ -258,6 +223,7 @@ class ChannelStream:
             self._prepare_dir()
             cmd = self._build_cmd()
             ff_log = open(os.path.join(LOG_DIR, f"{self.id}.ffmpeg.log"), "ab")
+            log.info(f"[{self.id}] FFmpeg başlatılıyor...")
             self.proc = subprocess.Popen(cmd, stdout=ff_log, stderr=ff_log, stdin=subprocess.DEVNULL, start_new_session=True)
             self.started_at = time.time()
 
@@ -266,6 +232,7 @@ class ChannelStream:
             if not self.proc:
                 return
             if self.proc.poll() is None:
+                log.info(f"[{self.id}] FFmpeg durduruldu.")
                 try:
                     self.proc.terminate()
                     try:
@@ -347,25 +314,18 @@ async def handle_m3u8(request):
     if not st:
         return web.Response(status=404, text="Kanal Yok", headers=CORS_HEADERS)
 
+    # --- KANAL KAPALIYSA: KOTA HARCAMAYAN SAF METİN DÖN ---
+    if not st.enabled:
+        return web.Response(
+            status=403,
+            text="YAYIN SU ANDA KAPALIDIR\nMac saatinde acilacaktir.",
+            content_type="text/plain; charset=utf-8",
+            headers=CORS_HEADERS
+        )
+
+    # --- KANAL AÇIKSA: CANLI YAYINI İŞLE ---
     client_ip = get_client_ip(request)
     st.record_viewer(client_ip)
-
-    scheme = request.headers.get("X-Forwarded-Proto", request.url.scheme)
-    host = request.headers.get("X-Forwarded-Host", request.host)
-    dynamic_proxy_url = f"{scheme}://{host}"
-
-    if not st.enabled:
-        seq = int(time.time() // HLS_TIME)
-        standby_lines = [
-            "#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{HLS_TIME}",
-            f"#EXT-X-MEDIA-SEQUENCE:{seq}",
-            f"#EXTINF:{HLS_TIME}.000,", f"{dynamic_proxy_url}/hls/standby/seg.ts?seq={seq}",
-            f"#EXTINF:{HLS_TIME}.000,", f"{dynamic_proxy_url}/hls/standby/seg.ts?seq={seq + 1}",
-            f"#EXTINF:{HLS_TIME}.000,", f"{dynamic_proxy_url}/hls/standby/seg.ts?seq={seq + 2}",
-        ]
-        resp_text = "\n".join(standby_lines)
-        tracker.add_bytes(len(resp_text.encode('utf-8')))
-        return web.Response(text=resp_text, content_type="application/vnd.apple.mpegurl", headers={**CORS_HEADERS, "Cache-Control": "no-cache"})
 
     res = await manager.ensure_running(cid)
     if not res:
@@ -380,6 +340,10 @@ async def handle_m3u8(request):
             content = f.read()
     except Exception as e:
         return web.Response(status=500, text=str(e), headers=CORS_HEADERS)
+
+    scheme = request.headers.get("X-Forwarded-Proto", request.url.scheme)
+    host = request.headers.get("X-Forwarded-Host", request.host)
+    dynamic_proxy_url = f"{scheme}://{host}"
 
     out_lines = []
     for line in content.splitlines():
@@ -403,8 +367,8 @@ async def handle_segment(request):
         return web.Response(status=400, headers=CORS_HEADERS)
 
     st = manager.get(cid)
-    if not st:
-        return web.Response(status=404, headers=CORS_HEADERS)
+    if not st or not st.enabled:
+        return web.Response(status=403, text="Kanal Kapalı", headers=CORS_HEADERS)
 
     client_ip = get_client_ip(request)
     st.record_viewer(client_ip)
@@ -421,17 +385,6 @@ async def handle_segment(request):
         return web.FileResponse(seg_path, headers={**CORS_HEADERS, "Cache-Control": "public, max-age=6", "Content-Type": "video/mp2t"})
     except Exception as e:
         return web.Response(status=500, text=str(e), headers=CORS_HEADERS)
-
-
-async def handle_standby_segment(request):
-    if not os.path.exists(STANDBY_TS_PATH):
-        generate_standby_clip()
-    if not os.path.exists(STANDBY_TS_PATH):
-        return web.Response(status=404, headers=CORS_HEADERS)
-
-    file_size = os.path.getsize(STANDBY_TS_PATH)
-    tracker.add_bytes(file_size)
-    return web.FileResponse(STANDBY_TS_PATH, headers={**CORS_HEADERS, "Cache-Control": "public, max-age=4", "Content-Type": "video/mp2t"})
 
 
 async def handle_health(request):
@@ -618,7 +571,6 @@ async def handle_admin_toggle(request):
 # ==================== APP ====================
 async def on_startup(app):
     os.makedirs(HLS_BASE_DIR, exist_ok=True)
-    generate_standby_clip()  # Standby klibi asenkron başlamadan önce kesinlikle tetiklenir
     app["monitor_task"] = asyncio.create_task(manager.monitor())
     app["save_task"] = asyncio.create_task(tracker.periodic_save())
     log.info("IPTV HLS Re-stream Proxy başlatıldı.")
@@ -639,7 +591,6 @@ def make_app():
     app.router.add_get("/admin", handle_admin_page)
     app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
-    app.router.add_get("/hls/standby/seg.ts", handle_standby_segment)
     app.router.add_get("/hls/{channel_id}/{name}", handle_segment)
     
     app.on_startup.append(on_startup)
