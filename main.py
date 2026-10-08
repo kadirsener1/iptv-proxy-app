@@ -100,8 +100,8 @@ class BandwidthTracker:
 tracker = BandwidthTracker(USAGE_FILE)
 
 
-# ==================== KANALLAR ====================
-KANALLAR = [
+# ==================== KANALLAR (DİNAMİK JSON DESTEKLİ) ====================
+DEFAULT_KANALLAR = [
     {
         "id": "futbol_tv",
         "name": "FUTBOL TV",
@@ -118,9 +118,25 @@ KANALLAR = [
     }
 ]
 
-DELETED_CHANNELS = ["bein_sports_1_6781", "BEİN SPORTS 1 (6781)", "bein sports 1 (6781)"]
-CHANNELS_MAP = {ch["id"]: ch for ch in KANALLAR}
+def load_dynamic_channels():
+    """Kanalları JSON dosyasından yükler, yoksa varsayılanları oluşturur."""
+    if os.path.exists(LOCAL_JSON_PATH):
+        try:
+            with open(LOCAL_JSON_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            log.warning(f"Kanallar JSON dosyasından yüklenemedi: {e}")
+    
+    # Dosya yoksa varsayılanları kaydet
+    try:
+        with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_KANALLAR, f, indent=2)
+    except Exception as e:
+        log.warning(f"Varsayılan kanallar yazılamadı: {e}")
+    return DEFAULT_KANALLAR
 
+KANALLAR = load_dynamic_channels()
+DELETED_CHANNELS = ["bein_sports_1_6781", "BEİN SPORTS 1 (6781)", "bein sports 1 (6781)"]
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -306,6 +322,28 @@ class StreamManager:
                 await st.start()
         return st
 
+    async def update_channel_url(self, cid: str, new_url: str):
+        """Kanal URL adresini dinamik olarak günceller ve kaydeder."""
+        st = self.streams.get(cid)
+        if st:
+            was_running = st.is_alive()
+            if was_running:
+                await st.stop()
+            
+            st.src = new_url
+            st.ch["url"] = new_url
+            
+            # JSON dosyasına kaydet
+            try:
+                channels_data = [s.ch for s in self.streams.values()]
+                with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
+                    json.dump(channels_data, f, indent=2)
+            except Exception as e:
+                log.error(f"Kanallar JSON dosyasına yazılamadı: {e}")
+
+            if was_running and st.enabled:
+                await st.start()
+
     async def monitor(self):
         while True:
             await asyncio.sleep(5)
@@ -428,7 +466,8 @@ async def handle_health(request):
     }
     for cid, st in manager.streams.items():
         status["channels"][cid] = {
-            "name": st.ch.get("name", cid), # Gerçek kanal ismi eklendi
+            "name": st.ch.get("name", cid), 
+            "url": st.src,  # URL eklendi (Admin panelinde gösterip düzenleyebilmek için)
             "enabled": st.enabled,
             "running": st.is_alive(),
             "ready": st.playlist_ready(),
@@ -465,6 +504,9 @@ ADMIN_HTML = """
         .badge-ffmpeg-off { background: #64748b; color: #cbd5e1; }
         input[type=password] { padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #1e293b; color: white; width: 100%; box-sizing: border-box; margin-bottom: 12px; font-size: 16px; text-align: center; }
         #loginArea { max-width: 400px; margin: 100px auto; text-align: center; }
+        .edit-group { margin-top: 12px; border-top: 1px solid #334155; padding-top: 10px; display: flex; gap: 8px; }
+        .edit-input { flex: 1; padding: 8px 10px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #cbd5e1; font-size: 13px; }
+        .btn-save { background: #3b82f6; font-size: 12px; padding: 6px 12px; }
     </style>
 </head>
 <body>
@@ -590,6 +632,12 @@ ADMIN_HTML = """
                                 ${info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ'}
                             </button>
                         </div>
+                        
+                        <!-- DİNAMİK YAYIN LİNKİ DÜZENLEME ALANI -->
+                        <div class="edit-group">
+                            <input type="text" id="url_${id}" class="edit-input" value="${info.url}" placeholder="Yayın (.m3u8) Linki">
+                            <button class="btn btn-save" onclick="updateChannelUrl('${id}')">Kaydet</button>
+                        </div>
                     `;
                     container.appendChild(card);
                 }
@@ -603,6 +651,24 @@ ADMIN_HTML = """
                 setTimeout(loadStatus, 500);
             } else {
                 alert('Oturum Geçersiz veya Şifre Hatalı!');
+                logout();
+            }
+        }
+
+        async function updateChannelUrl(id) {
+            const key = getStoredKey();
+            const newUrl = document.getElementById(`url_${id}`).value.trim();
+            if(!newUrl) {
+                alert("Lütfen geçerli bir yayın linki girin!");
+                return;
+            }
+            
+            const res = await fetch(`/admin/update_url?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&url=${encodeURIComponent(newUrl)}`);
+            if (res.ok) {
+                alert('Yayın linki başarıyla güncellendi!');
+                setTimeout(loadStatus, 500);
+            } else {
+                alert('Hata oluştu veya yetkisiz erişim!');
                 logout();
             }
         }
@@ -657,6 +723,25 @@ async def handle_admin_toggle(request):
 
     return web.json_response({"success": True, "id": cid, "enabled": st.enabled})
 
+async def handle_admin_update_url(request):
+    """Admin panelinden gelen yeni yayın URL'sini kaydeder"""
+    key = request.query.get("key")
+    cid = request.query.get("id")
+    new_url = request.query.get("url")
+
+    if key != ADMIN_KEY:
+        return web.Response(status=401, text="Yetkisiz Erişim")
+
+    st = manager.get(cid)
+    if not st:
+        return web.Response(status=404, text="Kanal Bulunamadı")
+
+    if not new_url:
+        return web.Response(status=400, text="Geçersiz URL")
+
+    await manager.update_channel_url(cid, new_url)
+    return web.json_response({"success": True, "id": cid, "url": new_url})
+
 
 # ==================== APP ====================
 async def on_startup(app):
@@ -682,6 +767,7 @@ def make_app():
     app.router.add_get("/admin", handle_admin_page)
     app.router.add_get("/admin/verify", handle_admin_verify)
     app.router.add_get("/admin/toggle", handle_admin_toggle)
+    app.router.add_get("/admin/update_url", handle_admin_update_url) # Düzenleme endpoint'i eklendi
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
     app.router.add_get("/hls/standby/seg.ts", handle_standby_segment)
     app.router.add_get("/hls/{channel_id}/{name}", handle_segment)
