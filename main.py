@@ -2,8 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import logging
-import asyncio
-import time
 import os
 import urllib.parse
 from aiohttp import web, ClientSession, ClientTimeout
@@ -30,37 +28,6 @@ FORWARD_HEADERS = {
     "Connection": "keep-alive"
 }
 
-TS_CACHE = {}
-
-async def cleanup_cache():
-    while True:
-        await asyncio.sleep(15)
-        now = time.time()
-        expired_keys = [k for k, v in TS_CACHE.items() if now - v[1] > 30]
-        for k in expired_keys:
-            del TS_CACHE[k]
-
-async def start_background_tasks(app):
-    app['cleanup_task'] = asyncio.create_task(cleanup_cache())
-
-async def cleanup_background_tasks(app):
-    app['cleanup_task'].cancel()
-    await app['cleanup_task']
-
-async def fetch_ts_segment(session, url):
-    if url in TS_CACHE:
-        return TS_CACHE[url][0]
-    
-    try:
-        async with session.get(url, headers=FORWARD_HEADERS, timeout=ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                data = await resp.read()
-                TS_CACHE[url] = (data, time.time())
-                return data
-    except Exception as e:
-        logging.error(f"Segment İndirme Hatası ({url}): {e}")
-    return None
-
 async def handle_m3u8(request):
     channel_id = request.match_info.get("channel_id")
     if channel_id not in KANALLAR:
@@ -82,9 +49,9 @@ async def handle_m3u8(request):
                 for line in content.splitlines():
                     line_str = line.strip()
                     if line_str and not line_str.startswith("#"):
+                        # TS linklerini tam adrese (Absolute URL) çevirip doğrudan kaynağa yönlendiriyoruz
                         abs_url = urllib.parse.urljoin(base_url, line_str)
-                        proxy_ts_url = f"/ts_proxy?url={urllib.parse.quote(abs_url)}"
-                        new_lines.append(proxy_ts_url)
+                        new_lines.append(abs_url)
                     else:
                         new_lines.append(line)
 
@@ -99,36 +66,12 @@ async def handle_m3u8(request):
         logging.error(f"[{channel_id}] M3U8 Hatası: {e}")
         return web.Response(status=502, text=str(e), headers=CORS_HEADERS)
 
-async def handle_ts_proxy(request):
-    raw_url = request.query.get("url")
-    if not raw_url:
-        return web.Response(status=400, text="URL Eksik", headers=CORS_HEADERS)
-
-    target_url = urllib.parse.unquote(raw_url)
-
-    if target_url in TS_CACHE:
-        data = TS_CACHE[target_url][0]
-    else:
-        async with ClientSession() as session:
-            data = await fetch_ts_segment(session, target_url)
-
-    if data:
-        response_headers = dict(CORS_HEADERS)
-        response_headers["Content-Type"] = "video/mp2t"
-        response_headers["Cache-Control"] = "public, max-age=60"
-        return web.Response(body=data, headers=response_headers)
-    else:
-        return web.Response(status=502, text="Segment Çekilemedi", headers=CORS_HEADERS)
-
 def make_app():
     app = web.Application()
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
-    app.router.add_get("/ts_proxy", handle_ts_proxy)
-    app.on_startup.append(start_background_tasks)
-    app.on_cleanup.append(cleanup_background_tasks)
     return app
 
 if __name__ == "__main__":
     app = make_app()
-    logging.info(f"[*] Single-Source Stream Caching Proxy Başlatıldı: Port {PROXY_PORT}")
+    logging.info(f"[*] Proxy Başlatıldı: Port {PROXY_PORT}")
     web.run_app(app, host=LOCAL_HOST, port=PROXY_PORT)
