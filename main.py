@@ -455,45 +455,110 @@ ADMIN_HTML = """
         .btn { padding: 10px 18px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; color: white; transition: 0.2s; }
         .btn-on { background: #22c55e; }
         .btn-off { background: #ef4444; }
+        .btn-logout { background: #475569; font-size: 11px; padding: 6px 12px; margin-top: 10px; }
         .status-badge { display: inline-block; padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: bold; }
         .badge-active { background: #15803d; }
         .badge-disabled { background: #b91c1c; }
         .badge-viewer { background: #0369a1; color: #e0f2fe; margin-left: 4px; }
-        input[type=password] { padding: 8px; border-radius: 6px; border: 1px solid #475569; background: #334155; color: white; width: 100%; box-sizing: border-box; margin-bottom: 10px; }
+        .badge-ffmpeg-on { background: #0284c7; color: white; }
+        .badge-ffmpeg-off { background: #64748b; color: #cbd5e1; }
+        input[type=password] { padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #1e293b; color: white; width: 100%; box-sizing: border-box; margin-bottom: 12px; font-size: 16px; text-align: center; }
+        #loginArea { max-width: 400px; margin: 100px auto; text-align: center; }
     </style>
 </head>
 <body>
-    <h2>📊 Sunucu & İzleyici Durumu</h2>
-    <div class="stats-grid">
-        <div class="stat-box">
-            <div class="stat-val" id="totalViewers" style="color:#a855f7;">0</div>
-            <div class="stat-lbl">Canlı İzleyici</div>
-        </div>
-        <div class="stat-box">
-            <div class="stat-val" id="servedGb">0.00 GB</div>
-            <div class="stat-lbl">Harcanan Kota (Aylık)</div>
-        </div>
-        <div class="stat-box">
-            <div class="stat-val" id="ramMb">0 MB</div>
-            <div class="stat-lbl">RAM Kullanımı</div>
-        </div>
+
+    <!-- GİRİŞ EKRANI -->
+    <div id="loginArea" class="card">
+        <h2>🔒 Yönetici Girişi</h2>
+        <p style="color: #94a3b8; font-size: 13px; margin-bottom: 15px;">Lütfen devam etmek için şifrenizi girin.</p>
+        <input type="password" id="adminPassword" placeholder="Şifre" onkeypress="handleKeyPress(event)">
+        <button class="btn btn-on" style="width: 100%;" onclick="attemptLogin()">Giriş Yap</button>
     </div>
 
-    <div class="card">
-        <label>Yönetici Şifresi:</label>
-        <input type="password" id="adminKey" value="admin123">
-    </div>
+    <!-- PANEL ALANI (Varsayılan olarak gizli) -->
+    <div id="panelArea" style="display: none;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <h2>📊 Sunucu & İzleyici Durumu</h2>
+            <button class="btn btn-logout" onclick="logout()">Çıkış Yap</button>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-box">
+                <div class="stat-val" id="totalViewers" style="color:#a855f7;">0</div>
+                <div class="stat-lbl">Canlı İzleyici</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-val" id="servedGb">0.00 GB</div>
+                <div class="stat-lbl">Harcanan Kota (Aylık)</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-val" id="ramMb">0 MB</div>
+                <div class="stat-lbl">RAM Kullanımı</div>
+            </div>
+        </div>
 
-    <h2>📺 Yayın Kontrolü</h2>
-    <div id="channels"></div>
+        <h2>📺 Yayın Kontrolü</h2>
+        <div id="channels"></div>
+    </div>
 
     <script>
+        let updateInterval = null;
+
+        function getStoredKey() {
+            return localStorage.getItem("admin_key") || "";
+        }
+
+        function handleKeyPress(e) {
+            if (e.key === 'Enter') {
+                attemptLogin();
+            }
+        }
+
+        async function verifyKey(key) {
+            try {
+                const res = await fetch(`/admin/verify?key=${encodeURIComponent(key)}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    return data.valid;
+                }
+            } catch (e) {}
+            return false;
+        }
+
+        async function attemptLogin() {
+            const key = document.getElementById('adminPassword').value;
+            const isValid = await verifyKey(key);
+            if (isValid) {
+                localStorage.setItem("admin_key", key);
+                showPanel();
+            } else {
+                alert('Şifre Hatalı!');
+            }
+        }
+
+        function logout() {
+            localStorage.removeItem("admin_key");
+            document.getElementById('adminPassword').value = "";
+            document.getElementById('panelArea').style.display = "none";
+            document.getElementById('loginArea').style.display = "block";
+            if (updateInterval) clearInterval(updateInterval);
+        }
+
+        async function showPanel() {
+            document.getElementById('loginArea').style.display = "none";
+            document.getElementById('panelArea').style.display = "block";
+            await loadStatus();
+            if (updateInterval) clearInterval(updateInterval);
+            updateInterval = setInterval(loadStatus, 3000);
+        }
+
         async function loadStatus() {
             try {
                 const res = await fetch('/health');
+                if (!res.ok) return;
                 const data = await res.json();
                 
-                // İstatistikleri güncelle
                 document.getElementById('totalViewers').innerText = data.server.total_viewers + " Kişi";
                 document.getElementById('servedGb').innerText = data.server.total_served_gb + " GB";
                 document.getElementById('ramMb').innerText = data.server.ram_usage_mb + " MB";
@@ -508,15 +573,17 @@ ADMIN_HTML = """
                         <div style="display:flex; justify-content:space-between; align-items:center;">
                             <div>
                                 <h3 style="margin:0 0 5px 0;">${id}</h3>
-                                <span class="status-badge ${info.enabled ? 'badge-active' : 'badge-disabled'}">
-                                    ${info.enabled ? 'YAYINDA' : 'KAPALI'}
-                                </span>
-                                <span class="status-badge badge-viewer">
-                                    👥 ${info.viewers} İzleyici
-                                </span>
-                                <span style="font-size:11px; color:#94a3b8; display:block; margin-top:4px;">
-                                    ${info.running ? '● FFmpeg Aktif' : '○ FFmpeg Kapalı'}
-                                </span>
+                                <div style="display:flex; gap: 5px; align-items:center; flex-wrap: wrap; margin-bottom: 6px;">
+                                    <span class="status-badge ${info.enabled ? 'badge-active' : 'badge-disabled'}">
+                                        ${info.enabled ? 'YAYINDA' : 'KAPALI'}
+                                    </span>
+                                    <span class="status-badge badge-viewer">
+                                        👥 ${info.viewers} İzleyici
+                                    </span>
+                                    <span class="status-badge ${info.running ? 'badge-ffmpeg-on' : 'badge-ffmpeg-off'}">
+                                        ${info.running ? '● FFmpeg Aktif' : '○ FFmpeg Kapalı'}
+                                    </span>
+                                </div>
                             </div>
                             <button class="btn ${info.enabled ? 'btn-off' : 'btn-on'}" onclick="toggleChannel('${id}', ${!info.enabled})">
                                 ${info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ'}
@@ -529,17 +596,31 @@ ADMIN_HTML = """
         }
 
         async function toggleChannel(id, enable) {
-            const key = document.getElementById('adminKey').value;
+            const key = getStoredKey();
             const res = await fetch(`/admin/toggle?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&enable=${enable}`);
             if (res.ok) {
-                loadStatus();
+                // Değişikliğin hemen yansıması için küçük bir bekleme ve yenileme
+                setTimeout(loadStatus, 500);
             } else {
-                alert('Şifre Hatalı!');
+                alert('Oturum Geçersiz veya Şifre Hatalı!');
+                logout();
             }
         }
 
-        loadStatus();
-        setInterval(loadStatus, 3000);
+        // Sayfa yüklendiğinde otomatik giriş kontrolü
+        async function init() {
+            const storedKey = getStoredKey();
+            if (storedKey) {
+                const isValid = await verifyKey(storedKey);
+                if (isValid) {
+                    showPanel();
+                    return;
+                }
+            }
+            logout();
+        }
+
+        init();
     </script>
 </body>
 </html>
@@ -547,6 +628,13 @@ ADMIN_HTML = """
 
 async def handle_admin_page(request):
     return web.Response(text=ADMIN_HTML, content_type="text/html")
+
+async def handle_admin_verify(request):
+    """Giriş şifresinin doğruluğunu kontrol eden endpoint"""
+    key = request.query.get("key")
+    if key == ADMIN_KEY:
+        return web.json_response({"valid": True}, headers=CORS_HEADERS)
+    return web.json_response({"valid": False}, status=401, headers=CORS_HEADERS)
 
 async def handle_admin_toggle(request):
     key = request.query.get("key")
@@ -563,6 +651,11 @@ async def handle_admin_toggle(request):
     st.enabled = enable
     if not enable:
         await st.stop()
+    else:
+        st.touch()          # Son istek zamanını güncelle
+        await st.start()    # FFmpeg sürecini anında başlat
+        await asyncio.sleep(0.5) # Durumun tam oturması ve is_alive() değerinin güncellenmesi için yarım saniye gecikme payı
+
     return web.json_response({"success": True, "id": cid, "enabled": st.enabled})
 
 
@@ -588,6 +681,7 @@ def make_app():
     app.router.add_get("/", handle_health)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/admin", handle_admin_page)
+    app.router.add_get("/admin/verify", handle_admin_verify)
     app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
     app.router.add_get("/hls/standby/seg.ts", handle_standby_segment)
