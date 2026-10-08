@@ -428,6 +428,7 @@ async def handle_health(request):
     }
     for cid, st in manager.streams.items():
         status["channels"][cid] = {
+            "name": st.ch.get("name", cid), # Gerçek kanal ismi eklendi
             "enabled": st.enabled,
             "running": st.is_alive(),
             "ready": st.playlist_ready(),
@@ -572,7 +573,7 @@ ADMIN_HTML = """
                     card.innerHTML = `
                         <div style="display:flex; justify-content:space-between; align-items:center;">
                             <div>
-                                <h3 style="margin:0 0 5px 0;">${id}</h3>
+                                <h3 style="margin:0 0 5px 0; color: #f8fafc;">${info.name || id}</h3>
                                 <div style="display:flex; gap: 5px; align-items:center; flex-wrap: wrap; margin-bottom: 6px;">
                                     <span class="status-badge ${info.enabled ? 'badge-active' : 'badge-disabled'}">
                                         ${info.enabled ? 'YAYINDA' : 'KAPALI'}
@@ -599,7 +600,6 @@ ADMIN_HTML = """
             const key = getStoredKey();
             const res = await fetch(`/admin/toggle?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&enable=${enable}`);
             if (res.ok) {
-                // Değişikliğin hemen yansıması için küçük bir bekleme ve yenileme
                 setTimeout(loadStatus, 500);
             } else {
                 alert('Oturum Geçersiz veya Şifre Hatalı!');
@@ -607,7 +607,6 @@ ADMIN_HTML = """
             }
         }
 
-        // Sayfa yüklendiğinde otomatik giriş kontrolü
         async function init() {
             const storedKey = getStoredKey();
             if (storedKey) {
@@ -652,9 +651,9 @@ async def handle_admin_toggle(request):
     if not enable:
         await st.stop()
     else:
-        st.touch()          # Son istek zamanını güncelle
-        await st.start()    # FFmpeg sürecini anında başlat
-        await asyncio.sleep(0.5) # Durumun tam oturması ve is_alive() değerinin güncellenmesi için yarım saniye gecikme payı
+        st.touch()          
+        await st.start()    
+        await asyncio.sleep(0.5) 
 
     return web.json_response({"success": True, "id": cid, "enabled": st.enabled})
 
