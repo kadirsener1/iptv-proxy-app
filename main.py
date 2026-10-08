@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FFmpeg tabanlı HLS re-stream proxy (Yönetici Kontrollü).
-- IPTV sağlayıcısına HER ZAMAN tek bağlantı olarak görünür.
-- /admin panelinden kanallar tek tıkla açılıp kapatılabilir.
+FFmpeg tabanlı HLS re-stream proxy (Standby Ekranlı).
+- Yayın kapatıldığında 'YAYIN KAPALIDIR' video döngüsü döner.
+- IPTV sağlayıcısına sıfır istek gider.
+- Ultra düşük kota ve sıfır CPU tüketir.
 """
 
 import os
@@ -20,7 +21,7 @@ from aiohttp import web
 # ==================== AYARLAR ====================
 BIND_HOST    = "0.0.0.0"
 PROXY_PORT   = int(os.environ.get("PORT", 8080))
-ADMIN_KEY    = os.environ.get("ADMIN_KEY", "Elz2302k.")  # <-- YÖNETİCİ ŞİFRENİZ
+ADMIN_KEY    = os.environ.get("ADMIN_KEY", "admin123")  # <-- YÖNETİCİ ŞİFRENİZ
 
 BASE_DIR = Path(__file__).resolve().parent
 LOCAL_M3U_PATH  = os.environ.get("LOCAL_M3U_PATH", str(BASE_DIR / "playlist.m3u"))
@@ -28,6 +29,8 @@ LOCAL_JSON_PATH = os.environ.get("LOCAL_JSON_PATH", str(BASE_DIR / "channels.jso
 LOG_DIR         = os.environ.get("LOG_DIR", str(BASE_DIR / "logs"))
 
 HLS_BASE_DIR = "/tmp/iptv_hls"
+STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
+
 HLS_TIME       = 4
 HLS_LIST_SIZE  = 12
 IDLE_TIMEOUT   = 100
@@ -72,6 +75,32 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger("iptv")
+
+
+# ==================== STANDBY (KAPALI) EKRANI OLUŞTURUCU ====================
+def generate_standby_clip():
+    """1 kereliğine mikro boyutlu 'Yayın Kapalıdır' video segmenti üretir"""
+    if os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
+        return
+
+    os.makedirs(HLS_BASE_DIR, exist_ok=True)
+    log.info("Standby (Yayın Kapalı) ekranı oluşturuluyor...")
+
+    # Siyah ekran üzerine şık yazı ve sessiz ses kanalı
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={HLS_TIME}:r=25",
+        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+        "-t", str(HLS_TIME),
+        "-vf", "drawtext=text='YAYIN SU ANDA KAPALIDIR\\n\\nMac Saatinde Acilacaktir':fontcolor=white:fontsize=44:x=(w-text_w)/2:y=(h-text_h)/2",
+        "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-b:v", "35k",
+        "-c:a", "aac", "-b:a", "16k",
+        "-f", "mpegts", STANDBY_TS_PATH
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+    except Exception as e:
+        log.warning(f"Standby klibi oluşturulamadı: {e}")
 
 
 # ==================== YEREL DOSYALARI GÜNCELLE ====================
@@ -136,7 +165,7 @@ class ChannelStream:
         self.last_request = 0.0
         self.lock = asyncio.Lock()
         self.started_at = 0.0
-        self.enabled = True   # <-- Kanalın açık/kapalı olma durumu
+        self.enabled = True
 
     def _prepare_dir(self):
         if os.path.isdir(self.dir):
@@ -172,7 +201,6 @@ class ChannelStream:
 
     async def start(self):
         if not self.enabled:
-            log.warning(f"[{self.id}] Kanal kapalı olduğu için FFmpeg başlatılmadı.")
             return
 
         async with self.lock:
@@ -281,10 +309,32 @@ async def handle_m3u8(request):
     if not st:
         return web.Response(status=404, text="Kanal Yok", headers=CORS_HEADERS)
 
-    # Kanal yönetici tarafından kapatılmışsa izleyiciyi engelle
-    if not st.enabled:
-        return web.Response(status=403, text="Yayın yönetici tarafından kapatıldı.", headers=CORS_HEADERS)
+    scheme = request.headers.get("X-Forwarded-Proto", request.url.scheme)
+    host = request.headers.get("X-Forwarded-Host", request.host)
+    dynamic_proxy_url = f"{scheme}://{host}"
 
+    # --- KANAL KAPALIYSA: STANDBY CANLI DÖNGÜ LİSTESİ DÖNDÜR ---
+    if not st.enabled:
+        seq = int(time.time() // HLS_TIME)
+        standby_lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            f"#EXT-X-TARGETDURATION:{HLS_TIME}",
+            f"#EXT-X-MEDIA-SEQUENCE:{seq}",
+            f"#EXTINF:{HLS_TIME}.000,",
+            f"{dynamic_proxy_url}/hls/standby/seg.ts?seq={seq}",
+            f"#EXTINF:{HLS_TIME}.000,",
+            f"{dynamic_proxy_url}/hls/standby/seg.ts?seq={seq + 1}",
+            f"#EXTINF:{HLS_TIME}.000,",
+            f"{dynamic_proxy_url}/hls/standby/seg.ts?seq={seq + 2}",
+        ]
+        return web.Response(
+            text="\n".join(standby_lines),
+            content_type="application/vnd.apple.mpegurl",
+            headers={**CORS_HEADERS, "Cache-Control": "no-cache"}
+        )
+
+    # --- KANAL AÇIKSA: NORMAL CANLI YAYINI DÖNDÜR ---
     st.touch()
     res = await manager.ensure_running(cid)
     if not res:
@@ -299,10 +349,6 @@ async def handle_m3u8(request):
             content = f.read()
     except Exception as e:
         return web.Response(status=500, text=str(e), headers=CORS_HEADERS)
-
-    scheme = request.headers.get("X-Forwarded-Proto", request.url.scheme)
-    host = request.headers.get("X-Forwarded-Host", request.host)
-    dynamic_proxy_url = f"{scheme}://{host}"
 
     out_lines = []
     for line in content.splitlines():
@@ -330,7 +376,7 @@ async def handle_segment(request):
         return web.Response(status=400, headers=CORS_HEADERS)
 
     st = manager.get(cid)
-    if not st or not st.enabled:
+    if not st:
         return web.Response(status=404, headers=CORS_HEADERS)
 
     st.touch()
@@ -353,6 +399,24 @@ async def handle_segment(request):
         return web.Response(status=500, text=str(e), headers=CORS_HEADERS)
 
 
+async def handle_standby_segment(request):
+    """Yayın kapalıyken döngüye giren tek 15 KB'lık mini segmenti sunar"""
+    if not os.path.exists(STANDBY_TS_PATH):
+        generate_standby_clip()
+
+    if not os.path.exists(STANDBY_TS_PATH):
+        return web.Response(status=404, headers=CORS_HEADERS)
+
+    return web.FileResponse(
+        STANDBY_TS_PATH,
+        headers={
+            **CORS_HEADERS,
+            "Cache-Control": "public, max-age=4",
+            "Content-Type": "video/mp2t"
+        }
+    )
+
+
 async def handle_health(request):
     status = {}
     for cid, st in manager.streams.items():
@@ -366,7 +430,7 @@ async def handle_health(request):
     return web.json_response(status, headers=CORS_HEADERS)
 
 
-# ==================== YÖNETİCİ PANELİ (HTML + API) ====================
+# ==================== YÖNETİCİ PANELİ ====================
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="tr">
@@ -410,10 +474,10 @@ ADMIN_HTML = """
                         <div>
                             <h3 style="margin:0 0 5px 0;">${id}</h3>
                             <span class="status-badge ${info.enabled ? 'badge-active' : 'badge-disabled'}">
-                                ${info.enabled ? 'AÇIK' : 'KAPALI'}
+                                ${info.enabled ? 'YAYINDA (CANLI)' : 'KAPALI (STANDBY EKRANI)'}
                             </span>
                             <span style="font-size:12px; color:#94a3b8; margin-left:5px;">
-                                ${info.running ? '(FFmpeg Çalışıyor)' : '(FFmpeg Uyuyor)'}
+                                ${info.running ? '(FFmpeg Aktif)' : '(FFmpeg Kapalı)'}
                             </span>
                         </div>
                         <button class="btn ${info.enabled ? 'btn-off' : 'btn-on'}" onclick="toggleChannel('${id}', ${!info.enabled})">
@@ -459,10 +523,10 @@ async def handle_admin_toggle(request):
 
     st.enabled = enable
     if not enable:
-        await st.stop()  # Kapatıldığında çalışan FFmpeg'i derhal öldür
-        log.info(f"[{cid}] Yönetici tarafından KAPATILDI.")
+        await st.stop()
+        log.info(f"[{cid}] Yayın KAPATILDI (Standby devreye girdi).")
     else:
-        log.info(f"[{cid}] Yönetici tarafından AÇILDI.")
+        log.info(f"[{cid}] Yayın AÇILDI.")
 
     return web.json_response({"success": True, "id": cid, "enabled": st.enabled})
 
@@ -470,6 +534,7 @@ async def handle_admin_toggle(request):
 # ==================== APP ====================
 async def on_startup(app):
     os.makedirs(HLS_BASE_DIR, exist_ok=True)
+    generate_standby_clip()
     app["monitor_task"] = asyncio.create_task(manager.monitor())
     log.info("IPTV HLS Re-stream Proxy başlatıldı.")
 
@@ -487,6 +552,7 @@ def make_app():
     app.router.add_get("/admin", handle_admin_page)
     app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
+    app.router.add_get("/hls/standby/seg.ts", handle_standby_segment)
     app.router.add_get("/hls/{channel_id}/{name}", handle_segment)
     
     app.on_startup.append(on_startup)
