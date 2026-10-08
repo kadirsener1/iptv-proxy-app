@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FFmpeg tabanlı HLS re-stream proxy.
+FFmpeg tabanlı HLS re-stream proxy (Yönetici Kontrollü).
 - IPTV sağlayıcısına HER ZAMAN tek bağlantı olarak görünür.
-- Segmentler RAM diskte veya /tmp dizininde tutulur.
-- İzleyici yoksa N saniye sonra FFmpeg kapanır.
+- /admin panelinden kanallar tek tıkla açılıp kapatılabilir.
 """
 
 import os
@@ -16,29 +15,23 @@ import asyncio
 import subprocess
 import logging
 from pathlib import Path
-from urllib.parse import quote
 from aiohttp import web
 
 # ==================== AYARLAR ====================
-# Render için HOST "0.0.0.0" olmalıdır. Port ise Render tarafından dinamik atanır.
 BIND_HOST    = "0.0.0.0"
 PROXY_PORT   = int(os.environ.get("PORT", 8080))
+ADMIN_KEY    = os.environ.get("ADMIN_KEY", "Elz2302k.")  # <-- YÖNETİCİ ŞİFRENİZ
 
-# Proje ana dizini
 BASE_DIR = Path(__file__).resolve().parent
-
-# Render uyumlu dosya yolları
 LOCAL_M3U_PATH  = os.environ.get("LOCAL_M3U_PATH", str(BASE_DIR / "playlist.m3u"))
 LOCAL_JSON_PATH = os.environ.get("LOCAL_JSON_PATH", str(BASE_DIR / "channels.json"))
 LOG_DIR         = os.environ.get("LOG_DIR", str(BASE_DIR / "logs"))
 
-# Render ortamı için /tmp disk kullanımı daha kararlıdır
 HLS_BASE_DIR = "/tmp/iptv_hls"
-
-HLS_TIME       = 4         # segment süresi (sn) — düşük gecikme: 2, kararlı: 4
-HLS_LIST_SIZE  = 12        # m3u8'de tutulacak segment sayısı
-IDLE_TIMEOUT   = 100       # izleyici yoksa FFmpeg'i kapat (sn)
-STARTUP_WAIT   = 60        # yayının hazır olması için beklenecek max sn
+HLS_TIME       = 4
+HLS_LIST_SIZE  = 12
+IDLE_TIMEOUT   = 100
+STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
 
 # ==================== KANALLAR ====================
@@ -60,12 +53,11 @@ KANALLAR = [
 ]
 
 DELETED_CHANNELS = ["bein_sports_1_6781", "BEİN SPORTS 1 (6781)", "bein sports 1 (6781)"]
-
 CHANNELS_MAP = {ch["id"]: ch for ch in KANALLAR}
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "*",
 }
 
@@ -84,10 +76,7 @@ log = logging.getLogger("iptv")
 
 # ==================== YEREL DOSYALARI GÜNCELLE ====================
 def update_local_files(external_url=None):
-    # Eğer Render dış URL'i tanımlıysa onu kullan, yoksa yerel portu kullan
     proxy_url = external_url or os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PROXY_PORT}")
-    
-    # Dizinlerin varlığından emin ol
     os.makedirs(os.path.dirname(LOCAL_JSON_PATH), exist_ok=True)
     os.makedirs(os.path.dirname(LOCAL_M3U_PATH), exist_ok=True)
 
@@ -107,8 +96,7 @@ def update_local_files(external_url=None):
         and item.get("name", "").strip().lower() not in deleted_lowers
     ]
 
-    proxy_map = {ch["name"].strip().lower(): f"{proxy_url}/live/{ch['id']}.m3u8"
-                 for ch in KANALLAR}
+    proxy_map = {ch["name"].strip().lower(): f"{proxy_url}/live/{ch['id']}.m3u8" for ch in KANALLAR}
     json_matched = set()
 
     for item in existing_json:
@@ -136,68 +124,19 @@ def update_local_files(external_url=None):
     except Exception as e:
         log.warning(f"JSON güncelleme hatası: {e}")
 
-    # playlist.m3u
-    # Eğer dosya yoksa sıfırdan oluştur
-    if not os.path.exists(LOCAL_M3U_PATH):
-        try:
-            with open(LOCAL_M3U_PATH, "w", encoding="utf-8") as f:
-                f.write("#EXTM3U\n")
-        except Exception:
-            pass
-
-    if os.path.exists(LOCAL_M3U_PATH):
-        try:
-            with open(LOCAL_M3U_PATH, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-
-            cleaned_lines = []
-            skip_next = False
-            for line in lines:
-                stripped = line.strip()
-                if any(d.lower() in stripped.lower() for d in DELETED_CHANNELS):
-                    skip_next = True
-                    continue
-                if skip_next and (stripped.startswith("http") or stripped.startswith("#EXTVLCOPT")):
-                    skip_next = False
-                    continue
-                skip_next = False
-
-                if stripped.startswith("#EXTINF"):
-                    for ch in KANALLAR:
-                        if ch["name"].lower() in stripped.lower():
-                            line = (f'#EXTINF:-1 tvg-id="{ch["id"]}" tvg-name="{ch["name"]}" '
-                                    f'tvg-logo="{ch["logo"]}" group-title="{ch["group"]}",{ch["name"]}\n')
-                            break
-                cleaned_lines.append(line)
-
-            # Eğer oynatma listesi boşsa temel kanalları ekle
-            if len(cleaned_lines) <= 1:
-                cleaned_lines = ["#EXTM3U\n"]
-                for ch in KANALLAR:
-                    cleaned_lines.append(
-                        f'#EXTINF:-1 tvg-id="{ch["id"]}" tvg-name="{ch["name"]}" '
-                        f'tvg-logo="{ch["logo"]}" group-title="{ch["group"]}",{ch["name"]}\n'
-                    )
-                    cleaned_lines.append(f"{proxy_url}/live/{ch['id']}.m3u8\n")
-
-            with open(LOCAL_M3U_PATH, "w", encoding="utf-8") as f:
-                f.writelines(cleaned_lines)
-        except Exception as e:
-            log.warning(f"M3U güncelleme hatası: {e}")
-
 
 # ==================== FFMPEG YÖNETİCİSİ ====================
 class ChannelStream:
     def __init__(self, channel: dict):
-        self.ch     = channel
-        self.id     = channel["id"]
-        self.src    = channel["url"]
-        self.dir    = os.path.join(HLS_BASE_DIR, self.id)
+        self.ch      = channel
+        self.id      = channel["id"]
+        self.src     = channel["url"]
+        self.dir     = os.path.join(HLS_BASE_DIR, self.id)
         self.proc: subprocess.Popen | None = None
         self.last_request = 0.0
         self.lock = asyncio.Lock()
         self.started_at = 0.0
-        self.consecutive_fails = 0
+        self.enabled = True   # <-- Kanalın açık/kapalı olma durumu
 
     def _prepare_dir(self):
         if os.path.isdir(self.dir):
@@ -232,6 +171,10 @@ class ChannelStream:
         return cmd
 
     async def start(self):
+        if not self.enabled:
+            log.warning(f"[{self.id}] Kanal kapalı olduğu için FFmpeg başlatılmadı.")
+            return
+
         async with self.lock:
             if self.proc and self.proc.poll() is None:
                 return
@@ -239,7 +182,7 @@ class ChannelStream:
             self._prepare_dir()
             cmd = self._build_cmd()
             ff_log = open(os.path.join(LOG_DIR, f"{self.id}.ffmpeg.log"), "ab")
-            log.info(f"[{self.id}] FFmpeg başlatılıyor (HLS_TIME={HLS_TIME}s, LIST_SIZE={HLS_LIST_SIZE})")
+            log.info(f"[{self.id}] FFmpeg başlatılıyor...")
             self.proc = subprocess.Popen(
                 cmd,
                 stdout=ff_log,
@@ -254,7 +197,7 @@ class ChannelStream:
             if not self.proc:
                 return
             if self.proc.poll() is None:
-                log.info(f"[{self.id}] FFmpeg durduruluyor (idle)")
+                log.info(f"[{self.id}] FFmpeg durduruluyor.")
                 try:
                     self.proc.terminate()
                     try:
@@ -292,24 +235,24 @@ class StreamManager:
         self.streams: dict[str, ChannelStream] = {
             ch["id"]: ChannelStream(ch) for ch in KANALLAR
         }
-        self._monitor_task = None
 
     def get(self, cid: str) -> ChannelStream | None:
         return self.streams.get(cid)
 
     async def ensure_running(self, cid: str) -> ChannelStream | None:
         st = self.streams.get(cid)
-        if not st:
+        if not st or not st.enabled:
             return None
         if not st.is_alive():
             await st.start()
+        
         waited = 0.0
         while waited < STARTUP_WAIT:
             if st.playlist_ready():
                 return st
             await asyncio.sleep(0.5)
             waited += 0.5
-            if not st.is_alive():
+            if not st.is_alive() and st.enabled:
                 await asyncio.sleep(0.5)
                 await st.start()
         return st
@@ -319,9 +262,11 @@ class StreamManager:
             await asyncio.sleep(5)
             now = time.time()
             for cid, st in self.streams.items():
-                if st.is_alive() and st.last_request and (now - st.last_request) > IDLE_TIMEOUT:
+                if not st.enabled and st.is_alive():
                     await st.stop()
-                elif (not st.is_alive()) and st.last_request and (now - st.last_request) < IDLE_TIMEOUT:
+                elif st.is_alive() and st.last_request and (now - st.last_request) > IDLE_TIMEOUT:
+                    await st.stop()
+                elif (not st.is_alive()) and st.enabled and st.last_request and (now - st.last_request) < IDLE_TIMEOUT:
                     log.warning(f"[{cid}] FFmpeg ölmüş, yeniden başlatılıyor")
                     await st.start()
 
@@ -336,8 +281,14 @@ async def handle_m3u8(request):
     if not st:
         return web.Response(status=404, text="Kanal Yok", headers=CORS_HEADERS)
 
+    # Kanal yönetici tarafından kapatılmışsa izleyiciyi engelle
+    if not st.enabled:
+        return web.Response(status=403, text="Yayın yönetici tarafından kapatıldı.", headers=CORS_HEADERS)
+
     st.touch()
-    await manager.ensure_running(cid)
+    res = await manager.ensure_running(cid)
+    if not res:
+        return web.Response(status=503, text="Yayın başlatılamadı.", headers=CORS_HEADERS)
 
     pl = st.playlist_path()
     if not os.path.exists(pl):
@@ -349,7 +300,6 @@ async def handle_m3u8(request):
     except Exception as e:
         return web.Response(status=500, text=str(e), headers=CORS_HEADERS)
 
-    # Render için dinamik dış protokol ve host bilgisini al
     scheme = request.headers.get("X-Forwarded-Proto", request.url.scheme)
     host = request.headers.get("X-Forwarded-Host", request.host)
     dynamic_proxy_url = f"{scheme}://{host}"
@@ -363,7 +313,6 @@ async def handle_m3u8(request):
             out_lines.append(s)
         else:
             seg_name = s.split("?")[0].split("/")[-1]
-            # Yerel host yerine dinamik olarak dışarıdan erişilebilir URL yazılır
             out_lines.append(f"{dynamic_proxy_url}/hls/{cid}/{seg_name}")
 
     return web.Response(
@@ -381,7 +330,7 @@ async def handle_segment(request):
         return web.Response(status=400, headers=CORS_HEADERS)
 
     st = manager.get(cid)
-    if not st:
+    if not st or not st.enabled:
         return web.Response(status=404, headers=CORS_HEADERS)
 
     st.touch()
@@ -408,28 +357,121 @@ async def handle_health(request):
     status = {}
     for cid, st in manager.streams.items():
         status[cid] = {
+            "enabled": st.enabled,
             "running": st.is_alive(),
             "ready": st.playlist_ready(),
             "last_request": st.last_request,
-            "uptime": time.time() - st.started_at if st.started_at else 0,
-            "hls_time": HLS_TIME,
-            "hls_list_size": HLS_LIST_SIZE,
+            "uptime": time.time() - st.started_at if st.started_at else 0
         }
     return web.json_response(status, headers=CORS_HEADERS)
 
 
-async def handle_options(request):
-    return web.Response(headers=CORS_HEADERS)
+# ==================== YÖNETİCİ PANELİ (HTML + API) ====================
+ADMIN_HTML = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IPTV Kontrol Paneli</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; max-width: 600px; margin: auto; }
+        .card { background: #1e293b; padding: 15px; border-radius: 12px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        h2 { margin-top: 0; color: #38bdf8; }
+        .btn { padding: 10px 18px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; color: white; transition: 0.2s; }
+        .btn-on { background: #22c55e; }
+        .btn-off { background: #ef4444; }
+        .status-badge { display: inline-block; padding: 4px 8px; border-radius: 6px; font-size: 12px; font-weight: bold; }
+        .badge-active { background: #15803d; }
+        .badge-disabled { background: #b91c1c; }
+        input[type=password] { padding: 8px; border-radius: 6px; border: 1px solid #475569; background: #334155; color: white; width: 100%; box-sizing: border-box; margin-bottom: 15px; }
+    </style>
+</head>
+<body>
+    <h2>📺 IPTV Yayın Kontrolü</h2>
+    <div class="card">
+        <label>Yönetici Şifresi:</label>
+        <input type="password" id="adminKey" value="admin123" placeholder="Şifrenizi girin">
+    </div>
+    <div id="channels"></div>
+
+    <script>
+        async function loadStatus() {
+            const res = await fetch('/health');
+            const data = await res.json();
+            const container = document.getElementById('channels');
+            container.innerHTML = '';
+
+            for (const [id, info] of Object.entries(data)) {
+                const card = document.createElement('div');
+                card.className = 'card';
+                card.innerHTML = `
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <h3 style="margin:0 0 5px 0;">${id}</h3>
+                            <span class="status-badge ${info.enabled ? 'badge-active' : 'badge-disabled'}">
+                                ${info.enabled ? 'AÇIK' : 'KAPALI'}
+                            </span>
+                            <span style="font-size:12px; color:#94a3b8; margin-left:5px;">
+                                ${info.running ? '(FFmpeg Çalışıyor)' : '(FFmpeg Uyuyor)'}
+                            </span>
+                        </div>
+                        <button class="btn ${info.enabled ? 'btn-off' : 'btn-on'}" onclick="toggleChannel('${id}', ${!info.enabled})">
+                            ${info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ'}
+                        </button>
+                    </div>
+                `;
+                container.appendChild(card);
+            }
+        }
+
+        async function toggleChannel(id, enable) {
+            const key = document.getElementById('adminKey').value;
+            const res = await fetch(`/admin/toggle?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&enable=${enable}`);
+            if (res.ok) {
+                loadStatus();
+            } else {
+                alert('Hata! Şifre yanlış olabilir.');
+            }
+        }
+
+        loadStatus();
+        setInterval(loadStatus, 5000);
+    </script>
+</body>
+</html>
+"""
+
+async def handle_admin_page(request):
+    return web.Response(text=ADMIN_HTML, content_type="text/html")
+
+async def handle_admin_toggle(request):
+    key = request.query.get("key")
+    cid = request.query.get("id")
+    enable = request.query.get("enable") == "true"
+
+    if key != ADMIN_KEY:
+        return web.Response(status=401, text="Yetkisiz Erişim")
+
+    st = manager.get(cid)
+    if not st:
+        return web.Response(status=404, text="Kanal Bulunamadı")
+
+    st.enabled = enable
+    if not enable:
+        await st.stop()  # Kapatıldığında çalışan FFmpeg'i derhal öldür
+        log.info(f"[{cid}] Yönetici tarafından KAPATILDI.")
+    else:
+        log.info(f"[{cid}] Yönetici tarafından AÇILDI.")
+
+    return web.json_response({"success": True, "id": cid, "enabled": st.enabled})
 
 
 # ==================== APP ====================
 async def on_startup(app):
     os.makedirs(HLS_BASE_DIR, exist_ok=True)
     app["monitor_task"] = asyncio.create_task(manager.monitor())
-    log.info(f"HLS dizini: {HLS_BASE_DIR}")
-    log.info(f"Ayarlar: HLS_TIME={HLS_TIME}s, HLS_LIST_SIZE={HLS_LIST_SIZE}")
     log.info("IPTV HLS Re-stream Proxy başlatıldı.")
-
 
 async def on_cleanup(app):
     for st in manager.streams.values():
@@ -438,22 +480,21 @@ async def on_cleanup(app):
     if t:
         t.cancel()
 
-
 def make_app():
     app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/admin", handle_admin_page)
+    app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
     app.router.add_get("/hls/{channel_id}/{name}", handle_segment)
-    app.router.add_get("/health", handle_health)
-    app.router.add_route("OPTIONS", "/{tail:.*}", handle_options)
+    
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
 
-
 if __name__ == "__main__":
     if shutil.which(FFMPEG_BIN) is None:
-        raise SystemExit("HATA: ffmpeg bulunamadı. Render ortamında kurulu olduğundan emin olun.")
-
+        raise SystemExit("HATA: ffmpeg bulunamadı.")
     update_local_files()
-    log.info("[*] IPTV HLS Re-stream Proxy başlatıldı: port %d", PROXY_PORT)
     web.run_app(make_app(), host=BIND_HOST, port=PROXY_PORT, access_log=None)
