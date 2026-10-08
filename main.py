@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FFmpeg tabanlı HLS re-stream proxy (Standby Ekranlı & Kota Sayaçlı).
+FFmpeg tabanlı HLS re-stream proxy (Canlı İzleyici Sayacı & Kota Takibi).
 """
 
 import os
@@ -35,7 +35,7 @@ STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
 APP_START_TIME = time.time()
 
-# Toplam veri sayacı (Bayt cinsinden)
+# Toplam harcanan veri (Bayt)
 TOTAL_BYTES_SERVED = 0
 
 # ==================== KANALLAR ====================
@@ -78,11 +78,20 @@ logging.basicConfig(
 log = logging.getLogger("iptv")
 
 
+def get_client_ip(request):
+    """Kullanıcının gerçek IP adresini tespit eder (Cloudflare/Render Proxy Uyumlu)"""
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip:
+        return cf_ip.strip()
+    return request.remote or "unknown"
+
+
 def get_memory_usage_mb():
-    """Anlık RAM kullanımını (MB) hesaplar"""
     try:
         import resource
-        # Linux'ta ru_maxrss KB cinsindendir
         usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         return round(usage / 1024, 2)
     except Exception:
@@ -122,6 +131,21 @@ class ChannelStream:
         self.lock = asyncio.Lock()
         self.started_at = 0.0
         self.enabled = True
+        self.viewers = {}  # {ip_adresi: son_istek_zamani}
+
+    def record_viewer(self, ip: str):
+        """İzleyicinin IP'sini kaydeder/günceller"""
+        if ip and ip != "unknown":
+            self.viewers[ip] = time.time()
+            self.touch()
+
+    def get_viewer_count(self) -> int:
+        """Son 12 saniye içinde istek atan benzersiz kullanıcı sayısı"""
+        now = time.time()
+        active = [ip for ip, last_seen in self.viewers.items() if (now - last_seen) <= 12]
+        # Eski IP'leri temizle
+        self.viewers = {ip: last_seen for ip, last_seen in self.viewers.items() if (now - last_seen) <= 60}
+        return len(active)
 
     def _prepare_dir(self):
         if os.path.isdir(self.dir):
@@ -200,6 +224,9 @@ class StreamManager:
     def get(self, cid: str) -> ChannelStream | None:
         return self.streams.get(cid)
 
+    def total_viewers(self) -> int:
+        return sum(st.get_viewer_count() for st in self.streams.values())
+
     async def ensure_running(self, cid: str) -> ChannelStream | None:
         st = self.streams.get(cid)
         if not st or not st.enabled:
@@ -240,6 +267,9 @@ async def handle_m3u8(request):
     if not st:
         return web.Response(status=404, text="Kanal Yok", headers=CORS_HEADERS)
 
+    client_ip = get_client_ip(request)
+    st.record_viewer(client_ip)
+
     scheme = request.headers.get("X-Forwarded-Proto", request.url.scheme)
     host = request.headers.get("X-Forwarded-Host", request.host)
     dynamic_proxy_url = f"{scheme}://{host}"
@@ -257,7 +287,6 @@ async def handle_m3u8(request):
         TOTAL_BYTES_SERVED += len(resp_text.encode('utf-8'))
         return web.Response(text=resp_text, content_type="application/vnd.apple.mpegurl", headers={**CORS_HEADERS, "Cache-Control": "no-cache"})
 
-    st.touch()
     res = await manager.ensure_running(cid)
     if not res:
         return web.Response(status=503, text="Yayın başlatılamadı.", headers=CORS_HEADERS)
@@ -298,7 +327,9 @@ async def handle_segment(request):
     if not st:
         return web.Response(status=404, headers=CORS_HEADERS)
 
-    st.touch()
+    client_ip = get_client_ip(request)
+    st.record_viewer(client_ip)
+
     seg_path = os.path.join(st.dir, name)
     if not os.path.exists(seg_path):
         await asyncio.sleep(0.3)
@@ -332,6 +363,7 @@ async def handle_health(request):
             "ram_usage_mb": get_memory_usage_mb(),
             "total_served_mb": round(TOTAL_BYTES_SERVED / (1024 * 1024), 2),
             "total_served_gb": round(TOTAL_BYTES_SERVED / (1024 * 1024 * 1024), 3),
+            "total_viewers": manager.total_viewers()
         },
         "channels": {}
     }
@@ -339,46 +371,52 @@ async def handle_health(request):
         status["channels"][cid] = {
             "enabled": st.enabled,
             "running": st.is_alive(),
-            "ready": st.playlist_ready()
+            "ready": st.playlist_ready(),
+            "viewers": st.get_viewer_count()
         }
     return web.json_response(status, headers=CORS_HEADERS)
 
 
-# ==================== YÖNETİCİ PANELİ (GÖSTERGELİ) ====================
+# ==================== YÖNETİCİ PANELİ (İZLEYİCİ SAYACLI) ====================
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IPTV Kontrol & Kota Paneli</title>
+    <title>IPTV Kontrol & Canlı İzleyici Paneli</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; max-width: 650px; margin: auto; }
         .card { background: #1e293b; padding: 15px; border-radius: 12px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-        .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 15px; }
+        .stats-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 15px; }
         .stat-box { background: #334155; padding: 12px; border-radius: 8px; text-align: center; }
         .stat-val { font-size: 20px; font-weight: bold; color: #38bdf8; }
-        .stat-lbl { font-size: 12px; color: #94a3b8; }
+        .stat-lbl { font-size: 11px; color: #94a3b8; margin-top: 4px; }
         h2 { color: #38bdf8; margin-top: 0; }
         .btn { padding: 10px 18px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; color: white; transition: 0.2s; }
         .btn-on { background: #22c55e; }
         .btn-off { background: #ef4444; }
-        .status-badge { display: inline-block; padding: 4px 8px; border-radius: 6px; font-size: 12px; font-weight: bold; }
+        .status-badge { display: inline-block; padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: bold; }
         .badge-active { background: #15803d; }
         .badge-disabled { background: #b91c1c; }
+        .badge-viewer { background: #0369a1; color: #e0f2fe; margin-left: 4px; }
         input[type=password] { padding: 8px; border-radius: 6px; border: 1px solid #475569; background: #334155; color: white; width: 100%; box-sizing: border-box; margin-bottom: 10px; }
     </style>
 </head>
 <body>
-    <h2>📊 Sunucu Durumu & Kota</h2>
+    <h2>📊 Sunucu & İzleyici Durumu</h2>
     <div class="stats-grid">
         <div class="stat-box">
+            <div class="stat-val" id="totalViewers" style="color:#a855f7;">0</div>
+            <div class="stat-lbl">Canlı İzleyici</div>
+        </div>
+        <div class="stat-box">
             <div class="stat-val" id="servedGb">0.00 GB</div>
-            <div class="stat-lbl">Harcanan Kota (100 GB Limit)</div>
+            <div class="stat-lbl">Harcanan Kota</div>
         </div>
         <div class="stat-box">
             <div class="stat-val" id="ramMb">0 MB</div>
-            <div class="stat-lbl">RAM Kullanımı (512 MB Limit)</div>
+            <div class="stat-lbl">RAM Kullanımı</div>
         </div>
     </div>
 
@@ -397,7 +435,8 @@ ADMIN_HTML = """
                 const data = await res.json();
                 
                 // İstatistikleri güncelle
-                document.getElementById('servedGb').innerText = data.server.total_served_gb + " GB (" + data.server.total_served_mb + " MB)";
+                document.getElementById('totalViewers').innerText = data.server.total_viewers + " Kişi";
+                document.getElementById('servedGb').innerText = data.server.total_served_gb + " GB";
                 document.getElementById('ramMb').innerText = data.server.ram_usage_mb + " MB";
 
                 const container = document.getElementById('channels');
@@ -411,10 +450,13 @@ ADMIN_HTML = """
                             <div>
                                 <h3 style="margin:0 0 5px 0;">${id}</h3>
                                 <span class="status-badge ${info.enabled ? 'badge-active' : 'badge-disabled'}">
-                                    ${info.enabled ? 'YAYINDA (CANLI)' : 'KAPALI (STANDBY)'}
+                                    ${info.enabled ? 'YAYINDA' : 'KAPALI'}
                                 </span>
-                                <span style="font-size:12px; color:#94a3b8; margin-left:5px;">
-                                    ${info.running ? '(FFmpeg Aktif)' : '(FFmpeg Kapalı)'}
+                                <span class="status-badge badge-viewer">
+                                    👥 ${info.viewers} İzleyici
+                                </span>
+                                <span style="font-size:11px; color:#94a3b8; display:block; margin-top:4px;">
+                                    ${info.running ? '● FFmpeg Aktif' : '○ FFmpeg Kapalı'}
                                 </span>
                             </div>
                             <button class="btn ${info.enabled ? 'btn-off' : 'btn-on'}" onclick="toggleChannel('${id}', ${!info.enabled})">
@@ -438,7 +480,7 @@ ADMIN_HTML = """
         }
 
         loadStatus();
-        setInterval(loadStatus, 4000);
+        setInterval(loadStatus, 3000);
     </script>
 </body>
 </html>
