@@ -467,7 +467,7 @@ async def handle_health(request):
     for cid, st in manager.streams.items():
         status["channels"][cid] = {
             "name": st.ch.get("name", cid), 
-            "url": st.src,  # URL eklendi (Admin panelinde gösterip düzenleyebilmek için)
+            "url": st.src,  # URL eklendi
             "enabled": st.enabled,
             "running": st.is_alive(),
             "ready": st.playlist_ready(),
@@ -607,39 +607,74 @@ ADMIN_HTML = """
                 document.getElementById('ramMb').innerText = data.server.ram_usage_mb + " MB";
 
                 const container = document.getElementById('channels');
-                container.innerHTML = '';
 
                 for (const [id, info] of Object.entries(data.channels)) {
-                    const card = document.createElement('div');
-                    card.className = 'card';
-                    card.innerHTML = `
-                        <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <div>
-                                <h3 style="margin:0 0 5px 0; color: #f8fafc;">${info.name || id}</h3>
-                                <div style="display:flex; gap: 5px; align-items:center; flex-wrap: wrap; margin-bottom: 6px;">
-                                    <span class="status-badge ${info.enabled ? 'badge-active' : 'badge-disabled'}">
-                                        ${info.enabled ? 'YAYINDA' : 'KAPALI'}
-                                    </span>
-                                    <span class="status-badge badge-viewer">
-                                        👥 ${info.viewers} İzleyici
-                                    </span>
-                                    <span class="status-badge ${info.running ? 'badge-ffmpeg-on' : 'badge-ffmpeg-off'}">
-                                        ${info.running ? '● FFmpeg Aktif' : '○ FFmpeg Kapalı'}
-                                    </span>
+                    let card = document.getElementById(`card_${id}`);
+                    if (!card) {
+                        card = document.createElement('div');
+                        card.id = `card_${id}`;
+                        card.className = 'card';
+                        container.appendChild(card);
+                    }
+
+                    // Düzenleme alanının şu an odakta (focus) olup olmadığını kontrol et
+                    const inputId = `url_${id}`;
+                    const activeElement = document.activeElement;
+                    const isInputFocused = (activeElement && activeElement.id === inputId);
+
+                    // Eğer kartın iç şablonu hiç oluşturulmamışsa ilk defa çiz
+                    if (!card.querySelector('.edit-input')) {
+                        card.innerHTML = `
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <div>
+                                    <h3 style="margin:0 0 5px 0; color: #f8fafc;" class="channel-title">${info.name || id}</h3>
+                                    <div style="display:flex; gap: 5px; align-items:center; flex-wrap: wrap; margin-bottom: 6px;">
+                                        <span class="status-badge badge-state ${info.enabled ? 'badge-active' : 'badge-disabled'}">
+                                            ${info.enabled ? 'YAYINDA' : 'KAPALI'}
+                                        </span>
+                                        <span class="status-badge badge-viewer badge-viewers-count">
+                                            👥 ${info.viewers} İzleyici
+                                        </span>
+                                        <span class="status-badge badge-ffmpeg ${info.running ? 'badge-ffmpeg-on' : 'badge-ffmpeg-off'}">
+                                            ${info.running ? '● FFmpeg Aktif' : '○ FFmpeg Kapalı'}
+                                        </span>
+                                    </div>
                                 </div>
+                                <button class="btn btn-toggle-action ${info.enabled ? 'btn-off' : 'btn-on'}" onclick="toggleChannel('${id}', ${!info.enabled})">
+                                    ${info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ'}
+                                </button>
                             </div>
-                            <button class="btn ${info.enabled ? 'btn-off' : 'btn-on'}" onclick="toggleChannel('${id}', ${!info.enabled})">
-                                ${info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ'}
-                            </button>
-                        </div>
+                            
+                            <div class="edit-group">
+                                <input type="text" id="${inputId}" class="edit-input" value="${info.url}" placeholder="Yayın (.m3u8) Linki">
+                                <button class="btn btn-save" onclick="updateChannelUrl('${id}')">Kaydet</button>
+                            </div>
+                        `;
+                    } else {
+                        // Eğer kart zaten varsa, odaktaki input kutusunun değerini ezmeden sadece statik alanları güncelle!
+                        card.querySelector('.channel-title').innerText = info.name || id;
                         
-                        <!-- DİNAMİK YAYIN LİNKİ DÜZENLEME ALANI -->
-                        <div class="edit-group">
-                            <input type="text" id="url_${id}" class="edit-input" value="${info.url}" placeholder="Yayın (.m3u8) Linki">
-                            <button class="btn btn-save" onclick="updateChannelUrl('${id}')">Kaydet</button>
-                        </div>
-                    `;
-                    container.appendChild(card);
+                        const badgeState = card.querySelector('.badge-state');
+                        badgeState.className = `status-badge badge-state ${info.enabled ? 'badge-active' : 'badge-disabled'}`;
+                        badgeState.innerText = info.enabled ? 'YAYINDA' : 'KAPALI';
+                        
+                        const badgeViewers = card.querySelector('.badge-viewers-count');
+                        badgeViewers.innerText = `👥 ${info.viewers} İzleyici`;
+                        
+                        const badgeFfmpeg = card.querySelector('.badge-ffmpeg');
+                        badgeFfmpeg.className = `status-badge badge-ffmpeg ${info.running ? 'badge-ffmpeg-on' : 'badge-ffmpeg-off'}`;
+                        badgeFfmpeg.innerText = info.running ? '● FFmpeg Aktif' : '○ FFmpeg Kapalı';
+                        
+                        const btnToggle = card.querySelector('.btn-toggle-action');
+                        btnToggle.className = `btn btn-toggle-action ${info.enabled ? 'btn-off' : 'btn-on'}`;
+                        btnToggle.innerText = info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ';
+                        btnToggle.setAttribute('onclick', `toggleChannel('${id}', ${!info.enabled})`);
+
+                        // Sadece input alanına dokunulmadığı (aktif olunmadığı) zaman değeri güncelle
+                        if (!isInputFocused) {
+                            card.querySelector('.edit-input').value = info.url;
+                        }
+                    }
                 }
             } catch(e) {}
         }
