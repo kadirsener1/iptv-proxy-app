@@ -57,7 +57,6 @@ class BandwidthTracker:
                         self.bytes_used = data.get("bytes", 0)
                         self.current_month = now_month
                     else:
-                        # Yeni aya girilmişse sıfırla
                         self.bytes_used = 0
                         self.current_month = now_month
                         self.save()
@@ -126,8 +125,6 @@ def load_dynamic_channels():
                 return json.load(f)
         except Exception as e:
             log.warning(f"Kanallar JSON dosyasından yüklenemedi: {e}")
-    
-    # Dosya yoksa varsayılanları kaydet
     try:
         with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_KANALLAR, f, indent=2)
@@ -141,6 +138,12 @@ CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "*",
+}
+NO_CACHE_HEADERS = {
+    **CORS_HEADERS,
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0"
 }
 
 # ==================== LOG ====================
@@ -209,19 +212,16 @@ class ChannelStream:
         self.lock = asyncio.Lock()
         self.started_at = 0.0
         self.enabled = True
-        self.viewers = {}  # {ip_adresi: son_istek_zamani}
+        self.viewers = {}
 
     def record_viewer(self, ip: str):
-        """İzleyicinin IP'sini kaydeder/günceller"""
         if ip and ip != "unknown":
             self.viewers[ip] = time.time()
             self.touch()
 
     def get_viewer_count(self) -> int:
-        """Son 12 saniye içinde istek atan benzersiz kullanıcı sayısı"""
         now = time.time()
         active = [ip for ip, last_seen in self.viewers.items() if (now - last_seen) <= 12]
-        # Eski IP'leri temizle
         self.viewers = {ip: last_seen for ip, last_seen in self.viewers.items() if (now - last_seen) <= 60}
         return len(active)
 
@@ -322,27 +322,33 @@ class StreamManager:
                 await st.start()
         return st
 
-    async def update_channel_url(self, cid: str, new_url: str):
+    async def update_channel_url(self, cid: str, new_url: str) -> bool:
         """Kanal URL adresini dinamik olarak günceller ve kaydeder."""
         st = self.streams.get(cid)
-        if st:
-            was_running = st.is_alive()
-            if was_running:
-                await st.stop()
-            
-            st.src = new_url
-            st.ch["url"] = new_url
-            
-            # JSON dosyasına kaydet
-            try:
-                channels_data = [s.ch for s in self.streams.values()]
-                with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
-                    json.dump(channels_data, f, indent=2)
-            except Exception as e:
-                log.error(f"Kanallar JSON dosyasına yazılamadı: {e}")
+        if not st:
+            return False
+        
+        was_running = st.is_alive()
+        if was_running:
+            await st.stop()
+        
+        # ANA GÜNCELLEME: Hem src hem de ch["url"] senkron olarak güncellenir
+        st.src = new_url
+        st.ch["url"] = new_url
+        
+        # JSON dosyasına kalıcı olarak kaydet
+        try:
+            channels_data = [s.ch for s in self.streams.values()]
+            with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(channels_data, f, indent=2, ensure_ascii=False)
+            log.info(f"Kanal URL güncellendi: {cid} -> {new_url}")
+        except Exception as e:
+            log.error(f"Kanallar JSON dosyasına yazılamadı: {e}")
 
-            if was_running and st.enabled:
-                await st.start()
+        if was_running and st.enabled:
+            await st.start()
+        
+        return True
 
     async def monitor(self):
         while True:
@@ -467,16 +473,17 @@ async def handle_health(request):
     for cid, st in manager.streams.items():
         status["channels"][cid] = {
             "name": st.ch.get("name", cid), 
-            "url": st.src,  # URL eklendi
+            "url": st.src,
             "enabled": st.enabled,
             "running": st.is_alive(),
             "ready": st.playlist_ready(),
             "viewers": st.get_viewer_count()
         }
-    return web.json_response(status, headers=CORS_HEADERS)
+    # ÖNEMLİ: Tarayıcı önbelleklemesini engelle
+    return web.json_response(status, headers=NO_CACHE_HEADERS)
 
 
-# ==================== YÖNETİCİ PANELİ (İZLEYİCİ SAYACLI) ====================
+# ==================== YÖNETİCİ PANELİ ====================
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="tr">
@@ -507,9 +514,12 @@ ADMIN_HTML = """
         .edit-group { margin-top: 12px; border-top: 1px solid #334155; padding-top: 10px; display: flex; gap: 8px; }
         .edit-input { flex: 1; padding: 8px 10px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #cbd5e1; font-size: 13px; }
         .btn-save { background: #3b82f6; font-size: 12px; padding: 6px 12px; }
+        .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #16a34a; color: white; padding: 12px 24px; border-radius: 8px; z-index: 9999; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
     </style>
 </head>
 <body>
+
+    <div id="toastMsg" class="toast"></div>
 
     <!-- GİRİŞ EKRANI -->
     <div id="loginArea" class="card">
@@ -519,7 +529,7 @@ ADMIN_HTML = """
         <button class="btn btn-on" style="width: 100%;" onclick="attemptLogin()">Giriş Yap</button>
     </div>
 
-    <!-- PANEL ALANI (Varsayılan olarak gizli) -->
+    <!-- PANEL ALANI -->
     <div id="panelArea" style="display: none;">
         <div style="display: flex; justify-content: space-between; align-items: center;">
             <h2>📊 Sunucu & İzleyici Durumu</h2>
@@ -548,6 +558,14 @@ ADMIN_HTML = """
     <script>
         let updateInterval = null;
 
+        function showToast(msg, color) {
+            const t = document.getElementById('toastMsg');
+            t.innerText = msg;
+            t.style.background = color || '#16a34a';
+            t.style.display = 'block';
+            setTimeout(() => { t.style.display = 'none'; }, 2500);
+        }
+
         function getStoredKey() {
             return localStorage.getItem("admin_key") || "";
         }
@@ -560,7 +578,7 @@ ADMIN_HTML = """
 
         async function verifyKey(key) {
             try {
-                const res = await fetch(`/admin/verify?key=${encodeURIComponent(key)}`);
+                const res = await fetch(`/admin/verify?key=${encodeURIComponent(key)}&_=${Date.now()}`, { cache: 'no-store' });
                 if (res.ok) {
                     const data = await res.json();
                     return data.valid;
@@ -598,7 +616,8 @@ ADMIN_HTML = """
 
         async function loadStatus() {
             try {
-                const res = await fetch('/health');
+                // Cache busting ile veri çek
+                const res = await fetch(`/health?_=${Date.now()}`, { cache: 'no-store' });
                 if (!res.ok) return;
                 const data = await res.json();
                 
@@ -617,12 +636,10 @@ ADMIN_HTML = """
                         container.appendChild(card);
                     }
 
-                    // Düzenleme alanının şu an odakta (focus) olup olmadığını kontrol et
                     const inputId = `url_${id}`;
                     const activeElement = document.activeElement;
                     const isInputFocused = (activeElement && activeElement.id === inputId);
 
-                    // Eğer kartın iç şablonu hiç oluşturulmamışsa ilk defa çiz
                     if (!card.querySelector('.edit-input')) {
                         card.innerHTML = `
                             <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -651,7 +668,6 @@ ADMIN_HTML = """
                             </div>
                         `;
                     } else {
-                        // Eğer kart zaten varsa, odaktaki input kutusunun değerini ezmeden sadece statik alanları güncelle!
                         card.querySelector('.channel-title').innerText = info.name || id;
                         
                         const badgeState = card.querySelector('.badge-state');
@@ -670,9 +686,12 @@ ADMIN_HTML = """
                         btnToggle.innerText = info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ';
                         btnToggle.setAttribute('onclick', `toggleChannel('${id}', ${!info.enabled})`);
 
-                        // Sadece input alanına dokunulmadığı (aktif olunmadığı) zaman değeri güncelle
+                        // Sadece input alanına dokunulmadığı zaman değeri güncelle
                         if (!isInputFocused) {
-                            card.querySelector('.edit-input').value = info.url;
+                            const inp = card.querySelector('.edit-input');
+                            if (inp.value !== info.url) {
+                                inp.value = info.url;
+                            }
                         }
                     }
                 }
@@ -681,7 +700,7 @@ ADMIN_HTML = """
 
         async function toggleChannel(id, enable) {
             const key = getStoredKey();
-            const res = await fetch(`/admin/toggle?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&enable=${enable}`);
+            const res = await fetch(`/admin/toggle?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&enable=${enable}&_=${Date.now()}`, { cache: 'no-store' });
             if (res.ok) {
                 setTimeout(loadStatus, 500);
             } else {
@@ -692,19 +711,29 @@ ADMIN_HTML = """
 
         async function updateChannelUrl(id) {
             const key = getStoredKey();
-            const newUrl = document.getElementById(`url_${id}`).value.trim();
+            const inputEl = document.getElementById(`url_${id}`);
+            const newUrl = inputEl.value.trim();
             if(!newUrl) {
-                alert("Lütfen geçerli bir yayın linki girin!");
+                showToast("Lütfen geçerli bir yayın linki girin!", "#dc2626");
                 return;
             }
             
-            const res = await fetch(`/admin/update_url?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&url=${encodeURIComponent(newUrl)}`);
-            if (res.ok) {
-                alert('Yayın linki başarıyla güncellendi!');
-                setTimeout(loadStatus, 500);
-            } else {
-                alert('Hata oluştu veya yetkisiz erişim!');
-                logout();
+            try {
+                const res = await fetch(`/admin/update_url?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&url=${encodeURIComponent(newUrl)}&_=${Date.now()}`, { cache: 'no-store' });
+                if (res.ok) {
+                    const data = await res.json();
+                    // Önce input'a yeni URL'yi atayıp odağı kaldır
+                    inputEl.value = data.url || newUrl;
+                    inputEl.blur();
+                    showToast('✅ Yayın linki başarıyla güncellendi!');
+                    // Durumu yenile
+                    setTimeout(loadStatus, 800);
+                } else {
+                    showToast('❌ Hata oluştu veya yetkisiz!', '#dc2626');
+                    if (res.status === 401) logout();
+                }
+            } catch(e) {
+                showToast('❌ Bağlantı hatası: ' + e.message, '#dc2626');
             }
         }
 
@@ -733,8 +762,8 @@ async def handle_admin_verify(request):
     """Giriş şifresinin doğruluğunu kontrol eden endpoint"""
     key = request.query.get("key")
     if key == ADMIN_KEY:
-        return web.json_response({"valid": True}, headers=CORS_HEADERS)
-    return web.json_response({"valid": False}, status=401, headers=CORS_HEADERS)
+        return web.json_response({"valid": True}, headers=NO_CACHE_HEADERS)
+    return web.json_response({"valid": False}, status=401, headers=NO_CACHE_HEADERS)
 
 async def handle_admin_toggle(request):
     key = request.query.get("key")
@@ -756,7 +785,7 @@ async def handle_admin_toggle(request):
         await st.start()    
         await asyncio.sleep(0.5) 
 
-    return web.json_response({"success": True, "id": cid, "enabled": st.enabled})
+    return web.json_response({"success": True, "id": cid, "enabled": st.enabled}, headers=NO_CACHE_HEADERS)
 
 async def handle_admin_update_url(request):
     """Admin panelinden gelen yeni yayın URL'sini kaydeder"""
@@ -774,8 +803,16 @@ async def handle_admin_update_url(request):
     if not new_url:
         return web.Response(status=400, text="Geçersiz URL")
 
-    await manager.update_channel_url(cid, new_url)
-    return web.json_response({"success": True, "id": cid, "url": new_url})
+    success = await manager.update_channel_url(cid, new_url)
+    if not success:
+        return web.Response(status=500, text="Güncelleme başarısız")
+    
+    # Güncel URL'yi geri döndür (frontend doğrulamak için)
+    return web.json_response({
+        "success": True, 
+        "id": cid, 
+        "url": st.src  # Backend'deki güncel değeri döndür
+    }, headers=NO_CACHE_HEADERS)
 
 
 # ==================== APP ====================
@@ -802,7 +839,7 @@ def make_app():
     app.router.add_get("/admin", handle_admin_page)
     app.router.add_get("/admin/verify", handle_admin_verify)
     app.router.add_get("/admin/toggle", handle_admin_toggle)
-    app.router.add_get("/admin/update_url", handle_admin_update_url) # Düzenleme endpoint'i eklendi
+    app.router.add_get("/admin/update_url", handle_admin_update_url)
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
     app.router.add_get("/hls/standby/seg.ts", handle_standby_segment)
     app.router.add_get("/hls/{channel_id}/{name}", handle_segment)
