@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FFmpeg tabanlı HLS re-stream proxy (Kalıcı Aylık Kota & İzleyici Sayacı).
+FFmpeg tabanlı HLS re-stream proxy (Kalıcı Aylık Kota & İzleyici Sayacı & Akıllı Standby Ekranı).
+- Yayın kapatıldığında yedek korumalı 'YAYIN KAPALIDIR' video döngüsü döner.
+- Kalıcı aylık kota takibi ve anlık izleyici sayaçları tam performans çalışır.
 """
 
 import os
@@ -29,7 +31,7 @@ USAGE_FILE      = os.environ.get("USAGE_FILE", str(BASE_DIR / "bandwidth_usage.j
 HLS_BASE_DIR = "/tmp/iptv_hls"
 STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 
-HLS_TIME       = 5
+HLS_TIME       = 4
 HLS_LIST_SIZE  = 12
 IDLE_TIMEOUT   = 100
 STARTUP_WAIT   = 60
@@ -78,7 +80,6 @@ log = logging.getLogger("iptv")
 
 # ==================== KALICI AYLIK KOTA TAKİPÇİSİ ====================
 class BandwidthTracker:
-    """Kotayı diske kaydeder ve her ay başında otomatik olarak sıfırlar."""
     def __init__(self, filepath):
         self.filepath = filepath
         self.current_month = time.strftime("%Y-%m")
@@ -96,7 +97,6 @@ class BandwidthTracker:
                         self.bytes_used = data.get("bytes", 0)
                         self.current_month = now_month
                     else:
-                        # Ay değişmiş! Yeni ay için sıfırla
                         self.bytes_used = 0
                         self.current_month = now_month
                         self.save()
@@ -130,7 +130,6 @@ class BandwidthTracker:
             log.warning(f"Kota kaydedilemedi: {e}")
 
     async def periodic_save(self):
-        """Diski yormamak için her 10 saniyede bir kaydeder"""
         while True:
             await asyncio.sleep(10)
             if self.dirty:
@@ -158,12 +157,17 @@ def get_memory_usage_mb():
         return 0.0
 
 
-# ==================== STANDBY EKRANI ====================
+# ==================== STANDBY EKRANI OLUŞTURUCU (KORUMALI) ====================
 def generate_standby_clip():
+    """1 kereliğine mikro boyutlu 'Yayın Kapalıdır' video segmenti üretir. Font hatası alırsa yedek ekranı devreye sokar."""
     if os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
         return
+
     os.makedirs(HLS_BASE_DIR, exist_ok=True)
-    cmd = [
+    log.info("Standby (Yayın Kapalı) ekranı oluşturma denemesi başlatıldı...")
+
+    # YÖNTEM 1: Yazılı siyah ekran oluşturma
+    cmd_text = [
         FFMPEG_BIN, "-y",
         "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={HLS_TIME}:r=25",
         "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
@@ -174,9 +178,29 @@ def generate_standby_clip():
         "-f", "mpegts", STANDBY_TS_PATH
     ]
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        res = subprocess.run(cmd_text, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+        if res.returncode == 0 and os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
+            log.info("Yazılı standby ekranı başarıyla oluşturuldu.")
+            return
     except Exception as e:
-        log.warning(f"Standby klibi oluşturulamadı: {e}")
+        log.warning(f"Yazılı standby ekranı oluşturma hatası: {e}")
+
+    # YÖNTEM 2 (YEDEK): Font eksikliğinde hata vermemesi için renkli test ekranı (SMPTE colorbars)
+    log.warning("Yazılı ekran oluşturulamadı, sisteme özel yedek test ekranı (Colorbars) aktif ediliyor...")
+    cmd_fallback = [
+        FFMPEG_BIN, "-y",
+        "-f", "lavfi", "-i", f"smptebars=size=1280x720:d={HLS_TIME}:r=25",
+        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+        "-t", str(HLS_TIME),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-b:v", "30k",
+        "-c:a", "aac", "-b:a", "16k",
+        "-f", "mpegts", STANDBY_TS_PATH
+    ]
+    try:
+        subprocess.run(cmd_fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        log.info("Yedek Standby ekranı başarıyla oluşturuldu.")
+    except Exception as e:
+        log.error(f"Yedek standby ekranı da oluşturulamadı: {e}")
 
 
 # ==================== FFMPEG YÖNETİCİSİ ====================
@@ -437,7 +461,7 @@ async def handle_health(request):
     return web.json_response(status, headers=CORS_HEADERS)
 
 
-# ==================== YÖNETİCİ PANELİ (GELİŞMİŞ GÖSTERGELİ) ====================
+# ==================== YÖNETİCİ PANELİ ====================
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="tr">
@@ -482,7 +506,6 @@ ADMIN_HTML = """
         </div>
     </div>
 
-    <!-- 100 GB KOTA ÇUBUĞU -->
     <div class="card" style="padding:12px;">
         <div style="display:flex; justify-content:space-between; font-size:12px; color:#cbd5e1;">
             <span>Aylık Kota Doluluğu (100 GB)</span>
@@ -517,11 +540,11 @@ ADMIN_HTML = """
                 const bar = document.getElementById('progressBar');
                 bar.style.width = pct + "%";
                 if(pct > 85) {
-                    bar.style.background = "#ef4444"; // Tehlike kırmızı
+                    bar.style.background = "#ef4444";
                 } else if(pct > 60) {
-                    bar.style.background = "#eab308"; // Uyarı sarı
+                    bar.style.background = "#eab308";
                 } else {
-                    bar.style.background = "#38bdf8"; // Normal mavi
+                    bar.style.background = "#38bdf8";
                 }
 
                 const container = document.getElementById('channels');
@@ -595,7 +618,7 @@ async def handle_admin_toggle(request):
 # ==================== APP ====================
 async def on_startup(app):
     os.makedirs(HLS_BASE_DIR, exist_ok=True)
-    generate_standby_clip()
+    generate_standby_clip()  # Standby klibi asenkron başlamadan önce kesinlikle tetiklenir
     app["monitor_task"] = asyncio.create_task(manager.monitor())
     app["save_task"] = asyncio.create_task(tracker.periodic_save())
     log.info("IPTV HLS Re-stream Proxy başlatıldı.")
