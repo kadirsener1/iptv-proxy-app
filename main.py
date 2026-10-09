@@ -39,13 +39,11 @@ STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
 APP_START_TIME = time.time()
 
-# Standby üretim kilit mekanizması
 standby_lock = asyncio.Lock()
 
 
 # ==================== KALICI AYLIK KOTA TAKİPÇİSİ ====================
 class BandwidthTracker:
-    """Kotayı diske kaydeder ve her ay başında otomatik olarak sıfırlar."""
     def __init__(self, filepath):
         self.filepath = filepath
         self.current_month = time.strftime("%Y-%m")
@@ -96,7 +94,6 @@ class BandwidthTracker:
             log.warning(f"Kota dosyaya kaydedilemedi: {e}")
 
     async def periodic_save(self):
-        """Performans için her 10 saniyede bir diske yazar."""
         while True:
             await asyncio.sleep(10)
             if self.dirty:
@@ -107,7 +104,6 @@ tracker = BandwidthTracker(USAGE_FILE)
 
 # ==================== SUNUCU DURUMU & UPTIME KONTROLÜ ====================
 class ServerState:
-    """Sunucu açık kalma süresi ve özelleştirilmiş standby mesajlarını saklar."""
     def __init__(self, filepath):
         self.filepath = filepath
         self.total_uptime_seconds = 0.0
@@ -138,7 +134,6 @@ class ServerState:
 server_state = ServerState(STATE_FILE)
 
 async def uptime_tracker_task():
-    """Periyodik olarak sunucunun toplam çalışma süresini günceller ve kaydeder."""
     while True:
         await asyncio.sleep(10)
         now = time.time()
@@ -148,7 +143,6 @@ async def uptime_tracker_task():
         server_state.save()
 
 def format_uptime(seconds: float) -> str:
-    """Saniyeyi gün, saat ve dakikaya dönüştürür."""
     days = int(seconds // 86400)
     hours = int((seconds % 86400) // 3600)
     minutes = int((seconds % 3600) // 60)
@@ -161,7 +155,7 @@ def format_uptime(seconds: float) -> str:
     return " ".join(parts) if parts else "0 Dk"
 
 
-# ==================== KANALLAR (GİZLİ ORTAM DEĞİŞKENLİ) ====================
+# ==================== KANALLAR ====================
 DEFAULT_KANALLAR = [
     {
         "id": "futbol_tv",
@@ -187,7 +181,6 @@ DEFAULT_KANALLAR = [
 ]
 
 def load_dynamic_channels():
-    """Kanalları JSON dosyasından yükler, yoksa ortam değişkenlerinden varsayılanları oluşturur."""
     if os.path.exists(LOCAL_JSON_PATH):
         try:
             with open(LOCAL_JSON_PATH, "r", encoding="utf-8") as f:
@@ -207,7 +200,6 @@ def load_dynamic_channels():
     return DEFAULT_KANALLAR
 
 KANALLAR = load_dynamic_channels()
-DELETED_CHANNELS = ["bein_sports_1_6781", "BEİN SPORTS 1 (6781)", "bein sports 1 (6781)"]
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -234,7 +226,6 @@ log = logging.getLogger("iptv")
 
 
 def get_client_ip(request):
-    """Kullanıcının gerçek IP adresini tespit eder (Cloudflare/Render Proxy Uyumlu)"""
     xff = request.headers.get("X-Forwarded-For")
     if xff:
         return xff.split(",")[0].strip()
@@ -253,15 +244,13 @@ def get_memory_usage_mb():
         return 0.0
 
 
-# ==================== STANDBY EKRANI (GÜVENLİ ASENKRON SÜRÜM) ====================
+# ==================== STANDBY EKRANI ====================
 async def generate_standby_clip(force=False):
-    """Standby klibini asenkron ve kilitli mekanizmayla güvenli şekilde oluşturur/günceller."""
     async with standby_lock:
         if not force and os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
             return True
 
         os.makedirs(HLS_BASE_DIR, exist_ok=True)
-
         text_file_path = os.path.join(HLS_BASE_DIR, "standby_text.txt")
         try:
             with open(text_file_path, "w", encoding="utf-8") as f:
@@ -271,11 +260,10 @@ async def generate_standby_clip(force=False):
 
         text_file_path_ff = text_file_path.replace('\\', '/').replace(':', '\\:')
 
-        # Standart drawtext komutu (Yazı tipi desteği varsa çalışır)
         cmd = [
             FFMPEG_BIN, "-y",
             "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={HLS_TIME}:r=25",
-            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
             "-t", str(HLS_TIME),
             "-vf", f"drawtext=textfile='{text_file_path_ff}':fontcolor=white:fontsize=44:x=(w-text_w)/2:y=(h-text_h)/2",
             "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-b:v", "35k",
@@ -283,43 +271,30 @@ async def generate_standby_clip(force=False):
             "-f", "mpegts", STANDBY_TS_PATH
         ]
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
             await asyncio.wait_for(proc.communicate(), timeout=15)
             if proc.returncode == 0 and os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
-                log.info("Standby klibi başarıyla oluşturuldu/güncellendi.")
+                log.info("Standby klibi başarıyla oluşturuldu.")
                 return True
-            else:
-                log.warning(f"Metin klibi üretilemedi (Hata kodu: {proc.returncode}). Fallback siyah ekran oluşturuluyor...")
-        except Exception as e:
-            log.warning(f"Yazılı Standby klibi oluşturulamadı, sistem yazı tipi eksik olabilir: {e}")
+        except Exception:
+            pass
 
-        # FALLBACK: Eğer sistemde font yoksa, hata alıp çökmek yerine temiz bir yazısız siyah ekran üretir
+        # Fallback temiz siyah ekran
         fallback_cmd = [
             FFMPEG_BIN, "-y",
             "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={HLS_TIME}:r=25",
-            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
             "-t", str(HLS_TIME),
             "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-b:v", "35k",
             "-c:a", "aac", "-b:a", "16k",
             "-f", "mpegts", STANDBY_TS_PATH
         ]
         try:
-            proc_fb = await asyncio.create_subprocess_exec(
-                *fallback_cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
+            proc_fb = await asyncio.create_subprocess_exec(*fallback_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
             await asyncio.wait_for(proc_fb.communicate(), timeout=10)
-            if proc_fb.returncode == 0:
-                log.info("Yazısız Siyah Standby Ekranı başarıyla oluşturuldu (Sistem fallback).")
-                return True
-        except Exception as fb_err:
-            log.error(f"Siyah ekran dahi oluşturulamadı: {fb_err}")
-        return False
+            return True
+        except Exception:
+            return False
 
 
 # ==================== OTO-ZAMANLAYICI KONTROLÜ ====================
@@ -335,7 +310,7 @@ def check_schedule(st) -> bool | None:
         return False
 
     start_str = st.ch.get("sched_start", "00:00")
-    end_str = st.ch.get("sched_end", "00:00")
+    end_str = st.ch.get("sched_end", "23:59")
 
     try:
         sh, sm = map(int, start_str.split(":"))
@@ -344,7 +319,10 @@ def check_schedule(st) -> bool | None:
         start_minutes = sh * 60 + sm
         end_minutes = eh * 60 + em
 
-        if start_minutes <= end_minutes:
+        if start_minutes == end_minutes:
+            return True
+
+        if start_minutes < end_minutes:
             return start_minutes <= now_minutes < end_minutes
         else:
             return now_minutes >= start_minutes or now_minutes < end_minutes
@@ -645,9 +623,9 @@ async def handle_health(request):
             "ready": st.playlist_ready(),
             "viewers": st.get_viewer_count(),
             "sched_enabled": st.ch.get("sched_enabled", False),
-            "sched_days": st.ch.get("sched_days", []),
+            "sched_days": st.ch.get("sched_days", [0, 1, 2, 3, 4, 5, 6]),
             "sched_start": st.ch.get("sched_start", "00:00"),
-            "sched_end": st.ch.get("sched_end", "00:00")
+            "sched_end": st.ch.get("sched_end", "23:59")
         }
     return web.json_response(status, headers=NO_CACHE_HEADERS)
 
@@ -686,10 +664,10 @@ ADMIN_HTML = """
         .btn-save { background: #3b82f6; font-size: 12px; padding: 6px 12px; }
         .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #16a34a; color: white; padding: 12px 24px; border-radius: 8px; z-index: 9999; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
         
-        .switch { position: relative; display: inline-block; width: 40px; height: 20px; }
+        .switch { position: relative; display: inline-block; width: 42px; height: 22px; }
         .switch input { opacity: 0; width: 0; height: 0; }
-        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #475569; transition: .3s; border-radius: 20px; }
-        .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background-color: white; transition: .3s; border-radius: 50%; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #475569; transition: .2s; border-radius: 20px; }
+        .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 3px; bottom: 3px; background-color: white; transition: .2s; border-radius: 50%; }
         input:checked + .slider { background-color: #22c55e; }
         input:checked + .slider:before { transform: translateX(20px); }
         
@@ -754,6 +732,7 @@ ADMIN_HTML = """
     <script>
         let updateInterval = null;
         let standbyLoaded = false;
+        let channelsRendered = false;
 
         function showToast(msg, color) {
             const t = document.getElementById('toastMsg');
@@ -800,6 +779,7 @@ ADMIN_HTML = """
             document.getElementById('adminPassword').value = "";
             document.getElementById('panelArea').style.display = "none";
             document.getElementById('loginArea').style.display = "block";
+            channelsRendered = false;
             if (updateInterval) clearInterval(updateInterval);
         }
 
@@ -831,18 +811,14 @@ ADMIN_HTML = """
 
                 for (const [id, info] of Object.entries(data.channels)) {
                     let card = document.getElementById(`card_${id}`);
+                    
                     if (!card) {
                         card = document.createElement('div');
                         card.id = `card_${id}`;
                         card.className = 'card';
                         container.appendChild(card);
-                    }
 
-                    const inputId = `url_${id}`;
-                    const activeElement = document.activeElement;
-                    const isInputFocused = (activeElement && (activeElement.id === inputId || activeElement.classList.contains(`sched-input-${id}`)));
-
-                    if (!card.querySelector('.edit-input')) {
+                        const inputId = `url_${id}`;
                         card.innerHTML = `
                             <div style="display:flex; justify-content:space-between; align-items:center;">
                                 <div>
@@ -892,27 +868,27 @@ ADMIN_HTML = """
                                     <div style="display:flex; gap:10px; margin-bottom:10px;">
                                         <div style="flex:1;">
                                             <span style="font-size:11px; color:#94a3b8;">Açılış Saati:</span>
-                                            <input type="time" id="sched_start_${id}" class="edit-input sched-input-${id}" style="width:100%; margin-top:3px;">
+                                            <input type="time" id="sched_start_${id}" class="edit-input" style="width:100%; margin-top:3px;" value="${info.sched_start || '00:00'}">
                                         </div>
                                         <div style="flex:1;">
                                             <span style="font-size:11px; color:#94a3b8;">Kapanış Saati:</span>
-                                            <input type="time" id="sched_end_${id}" class="edit-input sched-input-${id}" style="width:100%; margin-top:3px;">
+                                            <input type="time" id="sched_end_${id}" class="edit-input" style="width:100%; margin-top:3px;" value="${info.sched_end || '23:59'}">
                                         </div>
                                     </div>
-                                    <button class="btn btn-save" style="background:#059669; width:100%;" onclick="saveSchedule('${id}')">Zamanlayıcı Ayarlarını Kaydet</button>
+                                    <button class="btn btn-save" style="background:#059669; width:100%; padding:10px;" onclick="saveSchedule('${id}')">Zamanlayıcı Ayarlarını Kaydet</button>
                                 </div>
                             </div>
                         `;
 
-                        document.getElementById(`sched_enable_${id}`).checked = info.sched_enabled;
-                        document.getElementById(`sched_start_${id}`).value = info.sched_start;
-                        document.getElementById(`sched_end_${id}`).value = info.sched_end;
-                        info.sched_days.forEach(d => {
+                        document.getElementById(`sched_enable_${id}`).checked = Boolean(info.sched_enabled);
+                        const days = Array.isArray(info.sched_days) ? info.sched_days : [0,1,2,3,4,5,6];
+                        days.forEach(d => {
                             const cb = card.querySelector(`.sched-day-${id}[value="${d}"]`);
                             if (cb) cb.checked = true;
                         });
                         toggleScheduleUI(id);
                     } else {
+                        // SADECE GÖRSEL BİLGİLERİ GÜNCELLE - FORM ALANLARINA DOKUNMA!
                         card.querySelector('.channel-title').innerText = info.name || id;
                         
                         const badgeState = card.querySelector('.badge-state');
@@ -930,22 +906,6 @@ ADMIN_HTML = """
                         btnToggle.className = `btn btn-toggle-action ${info.enabled ? 'btn-off' : 'btn-on'}`;
                         btnToggle.innerText = info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ';
                         btnToggle.setAttribute('onclick', `toggleChannel('${id}', ${!info.enabled})`);
-
-                        if (!isInputFocused) {
-                            const inp = card.querySelector('.edit-input');
-                            if (inp.value !== info.url) {
-                                inp.value = info.url;
-                            }
-                            
-                            document.getElementById(`sched_enable_${id}`).checked = info.sched_enabled;
-                            document.getElementById(`sched_start_${id}`).value = info.sched_start;
-                            document.getElementById(`sched_end_${id}`).value = info.sched_end;
-                            
-                            card.querySelectorAll(`.sched-day-${id}`).forEach(cb => {
-                                cb.checked = info.sched_days.includes(parseInt(cb.value));
-                            });
-                            toggleScheduleUI(id);
-                        }
                     }
                 }
             } catch(e) {}
@@ -959,8 +919,8 @@ ADMIN_HTML = """
         async function saveSchedule(id) {
             const key = getStoredKey();
             const enabled = document.getElementById(`sched_enable_${id}`).checked;
-            const start = document.getElementById(`sched_start_${id}`).value;
-            const end = document.getElementById(`sched_end_${id}`).value;
+            const start = document.getElementById(`sched_start_${id}`).value || "00:00";
+            const end = document.getElementById(`sched_end_${id}`).value || "23:59";
             
             const days = [];
             document.querySelectorAll(`.sched-day-${id}:checked`).forEach(cb => {
@@ -970,7 +930,7 @@ ADMIN_HTML = """
             try {
                 const res = await fetch(`/admin/update_schedule?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&enabled=${enabled}&days=${days.join(",")}&start=${start}&end=${end}&_=${Date.now()}`, { cache: 'no-store' });
                 if (res.ok) {
-                    showToast('✅ Zamanlayıcı ayarları başarıyla kaydedildi!');
+                    showToast('✅ Zamanlayıcı ayarları kaydedildi!');
                     setTimeout(loadStatus, 500);
                 } else {
                     showToast('❌ Ayarlar kaydedilemedi!', '#dc2626');
@@ -991,7 +951,7 @@ ADMIN_HTML = """
             try {
                 const res = await fetch(`/admin/update_standby?key=${encodeURIComponent(key)}&message=${encodeURIComponent(message)}&_=${Date.now()}`, { cache: 'no-store' });
                 if (res.ok) {
-                    showToast('✅ Standby ekran mesajı güncellendi ve yeniden oluşturuldu!');
+                    showToast('✅ Standby ekran mesajı güncellendi!');
                 } else {
                     showToast('❌ Güncelleme başarısız oldu!', '#dc2626');
                 }
@@ -1023,8 +983,6 @@ ADMIN_HTML = """
             try {
                 const res = await fetch(`/admin/update_url?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&url=${encodeURIComponent(newUrl)}&_=${Date.now()}`, { cache: 'no-store' });
                 if (res.ok) {
-                    const data = await res.json();
-                    inputEl.value = data.url || newUrl;
                     inputEl.blur();
                     showToast('✅ Yayın linki başarıyla güncellendi!');
                     setTimeout(loadStatus, 800);
@@ -1114,11 +1072,7 @@ async def handle_admin_update_url(request):
     if not success:
         return web.Response(status=500, text="Güncelleme başarısız")
     
-    return web.json_response({
-        "success": True, 
-        "id": cid, 
-        "url": st.src
-    }, headers=NO_CACHE_HEADERS)
+    return web.json_response({"success": True, "id": cid, "url": st.src}, headers=NO_CACHE_HEADERS)
 
 async def handle_admin_update_standby(request):
     key = request.query.get("key")
@@ -1142,7 +1096,7 @@ async def handle_admin_update_schedule(request):
     enabled = request.query.get("enabled") == "true"
     days_str = request.query.get("days", "")
     start = request.query.get("start", "00:00")
-    end = request.query.get("end", "00:00")
+    end = request.query.get("end", "23:59")
 
     if key != ADMIN_KEY:
         return web.Response(status=401, text="Yetkisiz Erişim")
