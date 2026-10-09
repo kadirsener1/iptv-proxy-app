@@ -3,6 +3,7 @@
 """
 FFmpeg tabanlı HLS re-stream proxy (Canlı İzleyici Sayacı & Kalıcı Aylık Kota Takibi).
 Geliştirmeler: Kalıcı Toplam Uptime Takibi, Çoklu Kural Zamanlayıcı, Standby Mesajı & Ortam Değişkeni Güvenliği.
+Manuel + Zamanlayıcı birlikte çalışır: Zamanlayıcı kuralı aktifse kanal açık kalır (manuel kapatma geçersiz).
 """
 
 import os
@@ -34,8 +35,8 @@ STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 
 # --- BUFFER AYARLARI (Yüksek Buffer) ---
 HLS_TIME       = 4
-HLS_LIST_SIZE  = 30       # 12 -> 30 (~120 sn buffer)
-HLS_INIT_TIME  = 2        # İlk segment daha hızlı
+HLS_LIST_SIZE  = 15       # 12 -> 30 (~120 sn buffer)
+HLS_INIT_TIME  = 4        # İlk segment daha hızlı
 IDLE_TIMEOUT   = 100
 STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
@@ -208,13 +209,17 @@ def load_dynamic_channels():
                             ch["sched_rules"] = [{"days": legacy_days, "start": legacy_start, "end": legacy_end}]
                         else:
                             ch["sched_rules"] = []
+                    # manual_enabled yoksa enabled'dan türet
+                    if "manual_enabled" not in ch:
+                        ch["manual_enabled"] = ch.get("enabled", True)
                 return saved
         except Exception as e:
             log.warning(f"Kanallar JSON dosyasından yüklenemedi: {e}")
     try:
-        # Varsayılan kanallara sched_rules ekle
+        # Varsayılan kanallara sched_rules ve manual_enabled ekle
         for ch in DEFAULT_KANALLAR:
             ch.setdefault("sched_rules", [])
+            ch.setdefault("manual_enabled", ch.get("enabled", True))
         with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_KANALLAR, f, indent=2, ensure_ascii=False)
     except Exception as e:
@@ -356,7 +361,10 @@ class ChannelStream:
         self.last_request = 0.0
         self.lock = asyncio.Lock()
         self.started_at = 0.0
+        # enabled       = efektif durum (monitor tarafından hesaplanıp uygulanır)
+        # manual_enabled = kullanıcının son manuel kararı (AÇ/KAPAT butonu)
         self.enabled = channel.get("enabled", True)
+        self.manual_enabled = channel.get("manual_enabled", channel.get("enabled", True))
         self.viewers = {}
 
     def record_viewer(self, ip: str):
@@ -461,6 +469,22 @@ class StreamManager:
     def total_viewers(self) -> int:
         return sum(st.get_viewer_count() for st in self.streams.values())
 
+    def _compute_target_state(self, st: ChannelStream) -> bool:
+        """
+        Efektif durumu hesapla:
+        - Zamanlayıcı yoksa: manuel durum
+        - Zamanlayıcı varsa ve kural aktifse: AÇIK (manuel kapatma geçersiz)
+        - Zamanlayıcı varsa ve kural pasifse: manuel durum
+        """
+        sched_enabled = st.ch.get("sched_enabled", False)
+        if sched_enabled:
+            sched_state = check_schedule(st)
+            if sched_state is True:
+                return True  # Zamanlayıcı zorla açar
+            elif sched_state is False:
+                return st.manual_enabled  # Zamanlayıcı pasif, manuel karar geçerli
+        return st.manual_enabled
+
     async def ensure_running(self, cid: str) -> ChannelStream | None:
         st = self.streams.get(cid)
         if not st or not st.enabled:
@@ -508,18 +532,22 @@ class StreamManager:
             await asyncio.sleep(5)
             now = time.time()
             for cid, st in self.streams.items():
-                sched_state = check_schedule(st)
-                if sched_state is not None:
-                    if sched_state and not st.enabled:
-                        st.enabled = True
+                # Efektif hedef durumu hesapla
+                target = self._compute_target_state(st)
+
+                # Hedef durum değiştiyse uygula
+                if target != st.enabled:
+                    st.enabled = target
+                    st.ch["enabled"] = target
+                    if target:
                         st.touch()
                         await st.start()
-                        log.info(f"[Zamanlayıcı] {cid} yayını otomatik olarak BAŞLATILDI.")
-                    elif not sched_state and st.enabled:
-                        st.enabled = False
+                        log.info(f"[Zamanlayıcı] {cid} yayını OTOMATİK AÇILDI.")
+                    else:
                         await st.stop()
-                        log.info(f"[Zamanlayıcı] {cid} yayını otomatik olarak DURDURULDU.")
+                        log.info(f"[Zamanlayıcı] {cid} yayını OTOMATİK KAPATILDI.")
 
+                # Rutin kontroller
                 if not st.enabled and st.is_alive():
                     await st.stop()
                 elif st.is_alive() and st.last_request and (now - st.last_request) > IDLE_TIMEOUT:
@@ -643,12 +671,12 @@ async def handle_health(request):
             "name": st.ch.get("name", cid), 
             "url": st.src,
             "enabled": st.enabled,
+            "manual_enabled": st.manual_enabled,
             "running": st.is_alive(),
             "ready": st.playlist_ready(),
             "viewers": st.get_viewer_count(),
             "sched_enabled": st.ch.get("sched_enabled", False),
             "sched_rules": st.ch.get("sched_rules", []),
-            # Eski alanlar (uyumluluk için)
             "sched_days": st.ch.get("sched_days", []),
             "sched_start": st.ch.get("sched_start", "00:00"),
             "sched_end": st.ch.get("sched_end", "00:00")
@@ -683,6 +711,7 @@ ADMIN_HTML = """
         .badge-viewer { background: #0369a1; color: #e0f2fe; margin-left: 4px; }
         .badge-ffmpeg-on { background: #0284c7; color: white; }
         .badge-ffmpeg-off { background: #64748b; color: #cbd5e1; }
+        .badge-sched-forced { background: #f59e0b; color: #1e293b; margin-left: 4px; }
         input[type=password] { padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #1e293b; color: white; width: 100%; box-sizing: border-box; margin-bottom: 12px; font-size: 16px; text-align: center; }
         #loginArea { max-width: 400px; margin: 100px auto; text-align: center; }
         .edit-group { margin-top: 12px; border-top: 1px solid #334155; padding-top: 10px; display: flex; gap: 8px; }
@@ -854,6 +883,7 @@ ADMIN_HTML = """
                                         <span class="status-badge badge-state ${info.enabled ? 'badge-active' : 'badge-disabled'}">
                                             ${info.enabled ? 'YAYINDA' : 'KAPALI'}
                                         </span>
+                                        <span class="status-badge badge-sched-forced" style="display:none;">⏰ Zamanlayıcı</span>
                                         <span class="status-badge badge-viewer badge-viewers-count">
                                             👥 ${info.viewers} İzleyici
                                         </span>
@@ -862,8 +892,8 @@ ADMIN_HTML = """
                                         </span>
                                     </div>
                                 </div>
-                                <button class="btn btn-toggle-action ${info.enabled ? 'btn-off' : 'btn-on'}" onclick="toggleChannel('${id}', ${!info.enabled})">
-                                    ${info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ'}
+                                <button class="btn btn-toggle-action ${info.manual_enabled ? 'btn-off' : 'btn-on'}" onclick="toggleChannel('${id}', ${!info.manual_enabled})">
+                                    ${info.manual_enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ'}
                                 </button>
                             </div>
                             
@@ -896,9 +926,15 @@ ADMIN_HTML = """
                         // --- Güncelleme ---
                         card.querySelector('.channel-title').innerText = info.name || id;
                         
+                        // Zamanlayıcı zorla açtı mı?
+                        const schedForced = info.sched_enabled && info.enabled && !info.manual_enabled;
+
                         const badgeState = card.querySelector('.badge-state');
                         badgeState.className = `status-badge badge-state ${info.enabled ? 'badge-active' : 'badge-disabled'}`;
                         badgeState.innerText = info.enabled ? 'YAYINDA' : 'KAPALI';
+
+                        const schedBadge = card.querySelector('.badge-sched-forced');
+                        schedBadge.style.display = schedForced ? 'inline-block' : 'none';
                         
                         const badgeViewers = card.querySelector('.badge-viewers-count');
                         badgeViewers.innerText = `👥 ${info.viewers} İzleyici`;
@@ -907,10 +943,11 @@ ADMIN_HTML = """
                         badgeFfmpeg.className = `status-badge badge-ffmpeg ${info.running ? 'badge-ffmpeg-on' : 'badge-ffmpeg-off'}`;
                         badgeFfmpeg.innerText = info.running ? '● FFmpeg Aktif' : '○ FFmpeg Kapalı';
                         
+                        // Buton metni MANUEL karara göre (efektif duruma göre değil)
                         const btnToggle = card.querySelector('.btn-toggle-action');
-                        btnToggle.className = `btn btn-toggle-action ${info.enabled ? 'btn-off' : 'btn-on'}`;
-                        btnToggle.innerText = info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ';
-                        btnToggle.setAttribute('onclick', `toggleChannel('${id}', ${!info.enabled})`);
+                        btnToggle.className = `btn btn-toggle-action ${info.manual_enabled ? 'btn-off' : 'btn-on'}`;
+                        btnToggle.innerText = info.manual_enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ';
+                        btnToggle.setAttribute('onclick', `toggleChannel('${id}', ${!info.manual_enabled})`);
 
                         // URL input güncellemesi (kullanıcı yazıyorsa DOKUNMA)
                         const inp = card.querySelector('.edit-input');
@@ -996,7 +1033,6 @@ ADMIN_HTML = """
 
         function addScheduleRule(id) {
             markSchedDirty(id);
-            // Mevcut kuralları topla
             const current = collectScheduleRules(id);
             current.push({ days: [], start: "00:00", end: "00:00" });
             renderScheduleRules(id, current);
@@ -1140,6 +1176,7 @@ async def handle_admin_verify(request):
     return web.json_response({"valid": False}, status=401, headers=NO_CACHE_HEADERS)
 
 async def handle_admin_toggle(request):
+    """Manuel aç/kapa. Manuel karar kaydedilir; zamanlayıcı zorla açıyorsa efektif açık kalır."""
     key = request.query.get("key")
     cid = request.query.get("id")
     enable = request.query.get("enable") == "true"
@@ -1151,8 +1188,14 @@ async def handle_admin_toggle(request):
     if not st:
         return web.Response(status=404, text="Kanal Bulunamadı")
 
-    st.enabled = enable
-    st.ch["enabled"] = enable
+    # Kullanıcının manuel kararını kaydet
+    st.manual_enabled = enable
+    st.ch["manual_enabled"] = enable
+
+    # Efektif durumu hesapla (zamanlayıcı zorla açıyorsa açık kalır)
+    target = manager._compute_target_state(st)
+    st.enabled = target
+    st.ch["enabled"] = target
 
     try:
         channels_data = [s.ch for s in manager.streams.values()]
@@ -1161,14 +1204,19 @@ async def handle_admin_toggle(request):
     except Exception as e:
         log.warning(f"Kanal durumu diske kaydedilemedi: {e}")
 
-    if not enable:
+    if not target:
         await st.stop()
     else:
-        st.touch()          
-        await st.start()    
-        await asyncio.sleep(0.5) 
+        st.touch()
+        await st.start()
+        await asyncio.sleep(0.5)
 
-    return web.json_response({"success": True, "id": cid, "enabled": st.enabled}, headers=NO_CACHE_HEADERS)
+    return web.json_response({
+        "success": True,
+        "id": cid,
+        "enabled": st.enabled,
+        "manual_enabled": st.manual_enabled
+    }, headers=NO_CACHE_HEADERS)
 
 async def handle_admin_update_url(request):
     key = request.query.get("key")
@@ -1238,7 +1286,6 @@ async def handle_admin_update_schedule(request):
             days = [int(d) for d in r.get("days", []) if 0 <= int(d) <= 6]
             start = str(r.get("start", "00:00"))
             end = str(r.get("end", "00:00"))
-            # Basit saat formatı kontrolü
             for t in (start, end):
                 hh, mm = t.split(":")
                 assert 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59
@@ -1257,15 +1304,15 @@ async def handle_admin_update_schedule(request):
     except Exception as e:
         log.error(f"Zamanlayıcı ayarları kaydedilemedi: {e}")
 
-    # Hemen uygula
-    sched_state = check_schedule(st)
-    if sched_state is not None:
-        if sched_state and not st.enabled:
-            st.enabled = True
+    # Efektif durumu hemen uygula
+    target = manager._compute_target_state(st)
+    if target != st.enabled:
+        st.enabled = target
+        st.ch["enabled"] = target
+        if target:
             st.touch()
             await st.start()
-        elif not sched_state and st.enabled:
-            st.enabled = False
+        else:
             await st.stop()
 
     return web.json_response({"success": True, "id": cid, "rules": clean_rules}, headers=NO_CACHE_HEADERS)
@@ -1299,7 +1346,6 @@ def make_app():
     app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/admin/update_url", handle_admin_update_url)
     app.router.add_get("/admin/update_standby", handle_admin_update_standby)
-    # POST olarak değiştirildi (JSON body)
     app.router.add_post("/admin/update_schedule", handle_admin_update_schedule)
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
     app.router.add_get("/hls/standby/seg.ts", handle_standby_segment)
