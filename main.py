@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 FFmpeg tabanlı HLS re-stream proxy (Canlı İzleyici Sayacı & Kalıcı Aylık Kota Takibi).
-Geliştirmeler: Kalıcı Toplam Uptime Takibi, Kanal Zamanlayıcı, Standby Mesajı & Ortam Değişkeni Güvenliği.
+Geliştirmeler: Kalıcı Toplam Uptime Takibi, Çoklu Kural Zamanlayıcı, Standby Mesajı & Ortam Değişkeni Güvenliği.
 """
 
 import os
@@ -34,8 +34,8 @@ STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 
 # --- BUFFER AYARLARI (Yüksek Buffer) ---
 HLS_TIME       = 4
-HLS_LIST_SIZE  = 20       # 12 -> 20 (~80 sn buffer)
-HLS_INIT_TIME  = 3        # İlk segment daha hızlı
+HLS_LIST_SIZE  = 30       # 12 -> 30 (~120 sn buffer)
+HLS_INIT_TIME  = 2        # İlk segment daha hızlı
 IDLE_TIMEOUT   = 100
 STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
@@ -197,10 +197,24 @@ def load_dynamic_channels():
                 for def_ch in DEFAULT_KANALLAR:
                     if def_ch["id"] not in saved_ids:
                         saved.append(def_ch)
+
+                # Eski tek-kural formatını yeni çoklu-kural formatına dönüştür
+                for ch in saved:
+                    if "sched_rules" not in ch:
+                        legacy_days = ch.get("sched_days", [])
+                        legacy_start = ch.get("sched_start", "00:00")
+                        legacy_end = ch.get("sched_end", "00:00")
+                        if ch.get("sched_enabled") and (legacy_days or legacy_start != "00:00" or legacy_end != "00:00"):
+                            ch["sched_rules"] = [{"days": legacy_days, "start": legacy_start, "end": legacy_end}]
+                        else:
+                            ch["sched_rules"] = []
                 return saved
         except Exception as e:
             log.warning(f"Kanallar JSON dosyasından yüklenemedi: {e}")
     try:
+        # Varsayılan kanallara sched_rules ekle
+        for ch in DEFAULT_KANALLAR:
+            ch.setdefault("sched_rules", [])
         with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_KANALLAR, f, indent=2, ensure_ascii=False)
     except Exception as e:
@@ -286,34 +300,49 @@ def generate_standby_clip(force=False):
         log.warning(f"Standby klibi oluşturulamadı: {e}")
 
 
-# ==================== OTO-ZAMANLAYICI KONTROLÜ ====================
+# ==================== OTO-ZAMANLAYICI KONTROLÜ (ÇOKLU KURAL) ====================
 def check_schedule(st) -> bool | None:
+    """Çoklu kural desteği. Kurallardan herhangi biri aktifse True, hiçbiri değilse False."""
     if not st.ch.get("sched_enabled", False):
         return None
 
+    rules = st.ch.get("sched_rules", [])
+    if not rules:
+        # Eski format uyumluluğu (tek kural varsa onu kullan)
+        legacy_days = st.ch.get("sched_days", [])
+        legacy_start = st.ch.get("sched_start", "00:00")
+        legacy_end = st.ch.get("sched_end", "00:00")
+        if legacy_days or legacy_start != "00:00" or legacy_end != "00:00":
+            rules = [{"days": legacy_days, "start": legacy_start, "end": legacy_end}]
+        else:
+            return False
+
     now = datetime.datetime.now()
     day_of_week = now.weekday()
-    sched_days = st.ch.get("sched_days", [])
+    now_minutes = now.hour * 60 + now.minute
 
-    if day_of_week not in sched_days:
-        return False
+    for rule in rules:
+        rule_days = rule.get("days", [])
+        if day_of_week not in rule_days:
+            continue
 
-    start_str = st.ch.get("sched_start", "00:00")
-    end_str = st.ch.get("sched_end", "00:00")
+        try:
+            sh, sm = map(int, rule.get("start", "00:00").split(":"))
+            eh, em = map(int, rule.get("end", "00:00").split(":"))
+            start_minutes = sh * 60 + sm
+            end_minutes = eh * 60 + em
 
-    try:
-        sh, sm = map(int, start_str.split(":"))
-        eh, em = map(int, end_str.split(":"))
-        now_minutes = now.hour * 60 + now.minute
-        start_minutes = sh * 60 + sm
-        end_minutes = eh * 60 + em
+            if start_minutes <= end_minutes:
+                if start_minutes <= now_minutes < end_minutes:
+                    return True
+            else:
+                # Gece yarısını geçen aralık (örn: 23:00 - 02:00)
+                if now_minutes >= start_minutes or now_minutes < end_minutes:
+                    return True
+        except Exception:
+            continue
 
-        if start_minutes <= end_minutes:
-            return start_minutes <= now_minutes < end_minutes
-        else:
-            return now_minutes >= start_minutes or now_minutes < end_minutes
-    except Exception:
-        return False
+    return False
 
 
 # ==================== FFMPEG YÖNETİCİSİ ====================
@@ -618,6 +647,8 @@ async def handle_health(request):
             "ready": st.playlist_ready(),
             "viewers": st.get_viewer_count(),
             "sched_enabled": st.ch.get("sched_enabled", False),
+            "sched_rules": st.ch.get("sched_rules", []),
+            # Eski alanlar (uyumluluk için)
             "sched_days": st.ch.get("sched_days", []),
             "sched_start": st.ch.get("sched_start", "00:00"),
             "sched_end": st.ch.get("sched_end", "00:00")
@@ -812,7 +843,6 @@ ADMIN_HTML = """
                     }
 
                     const inputId = `url_${id}`;
-                    const activeElement = document.activeElement;
 
                     if (!card.querySelector('.edit-input')) {
                         // İlk oluşturma
@@ -842,49 +872,26 @@ ADMIN_HTML = """
                                 <button class="btn btn-save" onclick="updateChannelUrl('${id}')">Kaydet</button>
                             </div>
 
-                            <!-- OTO ZAMANLAYICI BÖLÜMÜ -->
+                            <!-- OTO ZAMANLAYICI BÖLÜMÜ (Çoklu Kural) -->
                             <div class="sched-box">
                                 <div style="display:flex; justify-content:space-between; align-items:center;">
-                                    <span style="font-weight:bold; font-size:12px; color:#38bdf8;">⏰ Otomatik Zamanlayıcı (Aç / Kapat)</span>
+                                    <span style="font-weight:bold; font-size:12px; color:#38bdf8;">⏰ Otomatik Zamanlayıcı (Çoklu Kural)</span>
                                     <label class="switch">
                                         <input type="checkbox" id="sched_enable_${id}" onchange="markSchedDirty('${id}'); toggleScheduleUI('${id}')">
                                         <span class="slider"></span>
                                     </label>
                                 </div>
                                 <div id="sched_fields_${id}" style="display:none; flex-direction:column; margin-top:8px;">
-                                    <span style="font-size:11px; color:#94a3b8;">Aktif Günler:</span>
-                                    <div class="days-container">
-                                        <label><input type="checkbox" class="sched-day-${id}" value="0" onchange="markSchedDirty('${id}')"> Pzt</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="1" onchange="markSchedDirty('${id}')"> Sal</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="2" onchange="markSchedDirty('${id}')"> Çar</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="3" onchange="markSchedDirty('${id}')"> Per</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="4" onchange="markSchedDirty('${id}')"> Cum</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="5" onchange="markSchedDirty('${id}')"> Cmt</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="6" onchange="markSchedDirty('${id}')"> Paz</label>
-                                    </div>
-                                    <div style="display:flex; gap:10px; margin-bottom:10px;">
-                                        <div style="flex:1;">
-                                            <span style="font-size:11px; color:#94a3b8;">Açılış Saati:</span>
-                                            <input type="time" id="sched_start_${id}" class="edit-input sched-input-${id}" style="width:100%; margin-top:3px;" onchange="markSchedDirty('${id}')">
-                                        </div>
-                                        <div style="flex:1;">
-                                            <span style="font-size:11px; color:#94a3b8;">Kapanış Saati:</span>
-                                            <input type="time" id="sched_end_${id}" class="edit-input sched-input-${id}" style="width:100%; margin-top:3px;" onchange="markSchedDirty('${id}')">
-                                        </div>
-                                    </div>
-                                    <button class="btn btn-save" style="background:#059669; width:100%;" onclick="saveSchedule('${id}')">Zamanlayıcı Ayarlarını Kaydet</button>
+                                    <div id="sched_rules_${id}" class="sched-rules-container"></div>
+                                    <button class="btn btn-save" style="background:#0ea5e9; width:100%; margin-top:8px;" onclick="addScheduleRule('${id}')">+ Yeni Kural Ekle</button>
+                                    <button class="btn btn-save" style="background:#059669; width:100%; margin-top:6px;" onclick="saveSchedule('${id}')">💾 Tüm Kuralları Kaydet</button>
                                 </div>
                             </div>
                         `;
 
                         document.getElementById(`sched_enable_${id}`).checked = info.sched_enabled;
-                        document.getElementById(`sched_start_${id}`).value = info.sched_start;
-                        document.getElementById(`sched_end_${id}`).value = info.sched_end;
-                        info.sched_days.forEach(d => {
-                            const cb = card.querySelector(`.sched-day-${id}[value="${d}"]`);
-                            if (cb) cb.checked = true;
-                        });
-                        toggleScheduleUI(id, true);  // silent = true (dirty işaretlemeden)
+                        renderScheduleRules(id, info.sched_rules || []);
+                        toggleScheduleUI(id, true);
                     } else {
                         // --- Güncelleme ---
                         card.querySelector('.channel-title').innerText = info.name || id;
@@ -912,29 +919,21 @@ ADMIN_HTML = """
                             inp.value = info.url;
                         }
 
-                        // --- ZAMANLAYICI UI GÜNCELLEMESİ ---
+                        // --- ZAMANLAYICI UI GÜNCELLEMESİ (Çoklu Kural) ---
                         const schedEnableEl = document.getElementById(`sched_enable_${id}`);
-                        const schedStartEl  = document.getElementById(`sched_start_${id}`);
-                        const schedEndEl    = document.getElementById(`sched_end_${id}`);
 
                         const schedFocused = document.activeElement && (
                             document.activeElement === schedEnableEl ||
-                            document.activeElement === schedStartEl ||
-                            document.activeElement === schedEndEl ||
-                            (document.activeElement.classList && document.activeElement.classList.contains(`sched-day-${id}`))
+                            (document.activeElement.id && document.activeElement.id.includes(`sched`)) ||
+                            (document.activeElement.classList && Array.from(document.activeElement.classList).some(c => c.includes(`sched-rule-`)))
                         );
 
-                        // Kullanıcı schedule alanıyla etkileşimdeyse VEYA dirty ise: sunucu değerleriyle EZME
                         const userInteracting = schedFocused || card.dataset.schedDirty === "1";
 
                         if (!userInteracting) {
                             schedEnableEl.checked = info.sched_enabled;
-                            schedStartEl.value = info.sched_start;
-                            schedEndEl.value = info.sched_end;
-                            card.querySelectorAll(`.sched-day-${id}`).forEach(cb => {
-                                cb.checked = info.sched_days.includes(parseInt(cb.value));
-                            });
-                            toggleScheduleUI(id, true);  // silent = true
+                            renderScheduleRules(id, info.sched_rules || []);
+                            toggleScheduleUI(id, true);  // silent
                         }
                     }
                 }
@@ -949,27 +948,102 @@ ADMIN_HTML = """
         function toggleScheduleUI(id, silent) {
             const enabled = document.getElementById(`sched_enable_${id}`).checked;
             document.getElementById(`sched_fields_${id}`).style.display = enabled ? "flex" : "none";
-            if (!silent) {
-                markSchedDirty(id);
+            if (!silent) markSchedDirty(id);
+        }
+
+        // --- ÇOKLU KURAL YÖNETİMİ ---
+        function buildRuleHTML(chanId, ruleIdx, rule) {
+            const days = ["Pzt","Sal","Çar","Per","Cum","Cmt","Paz"];
+            let dayHTML = "";
+            days.forEach((d, i) => {
+                const checked = (rule.days || []).includes(i) ? "checked" : "";
+                dayHTML += `<label><input type="checkbox" class="sched-rule-day-${chanId}-${ruleIdx}" value="${i}" ${checked} onchange="markSchedDirty('${chanId}')"> ${d}</label>`;
+            });
+            return `
+                <div class="sched-rule-item" id="sched_rule_${chanId}_${ruleIdx}" style="background:#1e293b; border:1px solid #334155; border-radius:8px; padding:10px; margin-bottom:8px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                        <span style="font-size:11px; color:#94a3b8; font-weight:bold;">Kural #${ruleIdx + 1}</span>
+                        <button onclick="removeScheduleRule('${chanId}', ${ruleIdx})" style="background:#dc2626; color:white; border:none; border-radius:4px; padding:3px 8px; font-size:11px; cursor:pointer;">✕ Sil</button>
+                    </div>
+                    <span style="font-size:11px; color:#94a3b8;">Aktif Günler:</span>
+                    <div class="days-container">${dayHTML}</div>
+                    <div style="display:flex; gap:10px;">
+                        <div style="flex:1;">
+                            <span style="font-size:11px; color:#94a3b8;">Açılış:</span>
+                            <input type="time" class="edit-input sched-rule-start-${chanId}-${ruleIdx}" value="${rule.start || '00:00'}" style="width:100%; margin-top:3px;" onchange="markSchedDirty('${chanId}')">
+                        </div>
+                        <div style="flex:1;">
+                            <span style="font-size:11px; color:#94a3b8;">Kapanış:</span>
+                            <input type="time" class="edit-input sched-rule-end-${chanId}-${ruleIdx}" value="${rule.end || '00:00'}" style="width:100%; margin-top:3px;" onchange="markSchedDirty('${chanId}')">
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderScheduleRules(id, rules) {
+            const container = document.getElementById(`sched_rules_${id}`);
+            if (!container) return;
+            container.innerHTML = "";
+            if (!rules || rules.length === 0) {
+                container.innerHTML = `<p style="color:#64748b; font-size:11px; text-align:center; padding:8px;">Henüz kural yok. "+ Yeni Kural Ekle" ile başlayın.</p>`;
+                return;
             }
+            rules.forEach((rule, idx) => {
+                container.innerHTML += buildRuleHTML(id, idx, rule);
+            });
+        }
+
+        function addScheduleRule(id) {
+            markSchedDirty(id);
+            // Mevcut kuralları topla
+            const current = collectScheduleRules(id);
+            current.push({ days: [], start: "00:00", end: "00:00" });
+            renderScheduleRules(id, current);
+        }
+
+        function removeScheduleRule(id, idx) {
+            markSchedDirty(id);
+            const current = collectScheduleRules(id);
+            current.splice(idx, 1);
+            renderScheduleRules(id, current);
+        }
+
+        function collectScheduleRules(id) {
+            const rules = [];
+            const container = document.getElementById(`sched_rules_${id}`);
+            if (!container) return rules;
+            const items = container.querySelectorAll('.sched-rule-item');
+            items.forEach((item, idx) => {
+                const days = [];
+                item.querySelectorAll(`.sched-rule-day-${id}-${idx}:checked`).forEach(cb => {
+                    days.push(parseInt(cb.value));
+                });
+                const start = item.querySelector(`.sched-rule-start-${id}-${idx}`).value || "00:00";
+                const end = item.querySelector(`.sched-rule-end-${id}-${idx}`).value || "00:00";
+                rules.push({ days, start, end });
+            });
+            return rules;
         }
 
         async function saveSchedule(id) {
             const key = getStoredKey();
             const enabled = document.getElementById(`sched_enable_${id}`).checked;
-            const start = document.getElementById(`sched_start_${id}`).value;
-            const end = document.getElementById(`sched_end_${id}`).value;
-            
-            const days = [];
-            document.querySelectorAll(`.sched-day-${id}:checked`).forEach(cb => {
-                days.push(cb.value);
-            });
+            const rules = collectScheduleRules(id);
+
+            if (enabled && rules.length === 0) {
+                showToast('⚠️ En az bir kural eklemelisiniz!', '#dc2626');
+                return;
+            }
 
             try {
-                const res = await fetch(`/admin/update_schedule?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&enabled=${enabled}&days=${days.join(",")}&start=${start}&end=${end}&_=${Date.now()}`, { cache: 'no-store' });
+                const res = await fetch(`/admin/update_schedule?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled, rules })
+                });
                 if (res.ok) {
-                    showToast('✅ Zamanlayıcı ayarları başarıyla kaydedildi!');
-                    // Dirty bayrağını temizle ki sunucudan gelen taze veri UI'yı güncelleyebilsin
+                    showToast('✅ Zamanlayıcı kuralları başarıyla kaydedildi!');
                     const card = document.getElementById(`card_${id}`);
                     if (card) card.dataset.schedDirty = "0";
                     setTimeout(loadStatus, 500);
@@ -1138,12 +1212,9 @@ async def handle_admin_update_standby(request):
     return web.json_response({"success": True, "message": message}, headers=NO_CACHE_HEADERS)
 
 async def handle_admin_update_schedule(request):
+    """Çoklu kural destekli zamanlayıcı kaydı. Body: JSON"""
     key = request.query.get("key")
     cid = request.query.get("id")
-    enabled = request.query.get("enabled") == "true"
-    days_str = request.query.get("days", "")
-    start = request.query.get("start", "00:00")
-    end = request.query.get("end", "00:00")
 
     if key != ADMIN_KEY:
         return web.Response(status=401, text="Yetkisiz Erişim")
@@ -1153,32 +1224,51 @@ async def handle_admin_update_schedule(request):
         return web.Response(status=404, text="Kanal Bulunamadı")
 
     try:
-        days_list = [int(d) for d in days_str.split(",") if d.strip() != ""]
-    except ValueError:
-        days_list = []
+        body = await request.json()
+    except Exception:
+        return web.Response(status=400, text="Geçersiz JSON")
+
+    enabled = bool(body.get("enabled", False))
+    rules_raw = body.get("rules", [])
+
+    # Kuralları doğrula ve temizle
+    clean_rules = []
+    for r in rules_raw:
+        try:
+            days = [int(d) for d in r.get("days", []) if 0 <= int(d) <= 6]
+            start = str(r.get("start", "00:00"))
+            end = str(r.get("end", "00:00"))
+            # Basit saat formatı kontrolü
+            for t in (start, end):
+                hh, mm = t.split(":")
+                assert 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59
+            clean_rules.append({"days": days, "start": start, "end": end})
+        except Exception:
+            continue
 
     st.ch["sched_enabled"] = enabled
-    st.ch["sched_days"] = days_list
-    st.ch["sched_start"] = start
-    st.ch["sched_end"] = end
+    st.ch["sched_rules"] = clean_rules
 
     try:
         channels_data = [s.ch for s in manager.streams.values()]
         with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
             json.dump(channels_data, f, indent=2, ensure_ascii=False)
-        log.info(f"Kanal zamanlayıcı ayarları kaydedildi: {cid}")
+        log.info(f"Zamanlayıcı kuralları kaydedildi: {cid} ({len(clean_rules)} kural)")
     except Exception as e:
         log.error(f"Zamanlayıcı ayarları kaydedilemedi: {e}")
 
+    # Hemen uygula
     sched_state = check_schedule(st)
     if sched_state is not None:
-        st.enabled = sched_state
-        if sched_state and not st.is_alive():
+        if sched_state and not st.enabled:
+            st.enabled = True
+            st.touch()
             await st.start()
-        elif not sched_state and st.is_alive():
+        elif not sched_state and st.enabled:
+            st.enabled = False
             await st.stop()
 
-    return web.json_response({"success": True, "id": cid}, headers=NO_CACHE_HEADERS)
+    return web.json_response({"success": True, "id": cid, "rules": clean_rules}, headers=NO_CACHE_HEADERS)
 
 
 # ==================== APP STARTUP & CLEANUP ====================
@@ -1209,7 +1299,8 @@ def make_app():
     app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/admin/update_url", handle_admin_update_url)
     app.router.add_get("/admin/update_standby", handle_admin_update_standby)
-    app.router.add_get("/admin/update_schedule", handle_admin_update_schedule)
+    # POST olarak değiştirildi (JSON body)
+    app.router.add_post("/admin/update_schedule", handle_admin_update_schedule)
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
     app.router.add_get("/hls/standby/seg.ts", handle_standby_segment)
     app.router.add_get("/hls/{channel_id}/{name}", handle_segment)
