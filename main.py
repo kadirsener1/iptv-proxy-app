@@ -32,8 +32,10 @@ STATE_FILE      = os.environ.get("STATE_FILE", str(BASE_DIR / "server_state.json
 HLS_BASE_DIR = "/tmp/iptv_hls"
 STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 
+# --- BUFFER AYARLARI (Yüksek Buffer) ---
 HLS_TIME       = 4
-HLS_LIST_SIZE  = 12
+HLS_LIST_SIZE  = 20       # 12 -> 20 (~80 sn buffer)
+HLS_INIT_TIME  = 3        # İlk segment daha hızlı
 IDLE_TIMEOUT   = 100
 STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
@@ -350,13 +352,24 @@ class ChannelStream:
 
         cmd = [
             FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-nostdin",
-            "-rw_timeout", "15000000", "-reconnect", "1", "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5", "-user_agent", "VLC/3.0.18 LibVLC/3.0.18",
+            # --- YÜKSEK BUFFER AYARLARI ---
+            "-probesize", "10000000",          # 10 MB analiz
+            "-analyzeduration", "10000000",    # 10 sn analiz
+            "-fflags", "+genpts+igndts+discardcorrupt",
+            "-max_delay", "5000000",           # 5 sn max gecikme
+            "-rw_timeout", "15000000",
+            "-reconnect", "1", "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-user_agent", "VLC/3.0.18 LibVLC/3.0.18",
             "-i", self.src, "-c", "copy", "-f", "hls",
-            "-hls_time", str(HLS_TIME), "-hls_list_size", str(HLS_LIST_SIZE),
+            "-hls_time", str(HLS_TIME),
+            "-hls_list_size", str(HLS_LIST_SIZE),   # 30 -> ~120 sn buffer
+            "-hls_init_time", str(HLS_INIT_TIME),   # İlk segment 2 sn
             "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
-            "-hls_segment_type", "mpegts", "-hls_segment_filename", seg_pattern,
-            "-hls_allow_cache", "1", m3u8_path
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", seg_pattern,
+            "-hls_allow_cache", "1",
+            m3u8_path
         ]
         return cmd
 
@@ -800,9 +813,9 @@ ADMIN_HTML = """
 
                     const inputId = `url_${id}`;
                     const activeElement = document.activeElement;
-                    const isInputFocused = (activeElement && (activeElement.id === inputId || activeElement.classList.contains(`sched-input-${id}`)));
 
                     if (!card.querySelector('.edit-input')) {
+                        // İlk oluşturma
                         card.innerHTML = `
                             <div style="display:flex; justify-content:space-between; align-items:center;">
                                 <div>
@@ -834,29 +847,29 @@ ADMIN_HTML = """
                                 <div style="display:flex; justify-content:space-between; align-items:center;">
                                     <span style="font-weight:bold; font-size:12px; color:#38bdf8;">⏰ Otomatik Zamanlayıcı (Aç / Kapat)</span>
                                     <label class="switch">
-                                        <input type="checkbox" id="sched_enable_${id}" onchange="toggleScheduleUI('${id}')">
+                                        <input type="checkbox" id="sched_enable_${id}" onchange="markSchedDirty('${id}'); toggleScheduleUI('${id}')">
                                         <span class="slider"></span>
                                     </label>
                                 </div>
                                 <div id="sched_fields_${id}" style="display:none; flex-direction:column; margin-top:8px;">
                                     <span style="font-size:11px; color:#94a3b8;">Aktif Günler:</span>
                                     <div class="days-container">
-                                        <label><input type="checkbox" class="sched-day-${id}" value="0"> Pzt</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="1"> Sal</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="2"> Çar</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="3"> Per</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="4"> Cum</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="5"> Cmt</label>
-                                        <label><input type="checkbox" class="sched-day-${id}" value="6"> Paz</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="0" onchange="markSchedDirty('${id}')"> Pzt</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="1" onchange="markSchedDirty('${id}')"> Sal</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="2" onchange="markSchedDirty('${id}')"> Çar</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="3" onchange="markSchedDirty('${id}')"> Per</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="4" onchange="markSchedDirty('${id}')"> Cum</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="5" onchange="markSchedDirty('${id}')"> Cmt</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="6" onchange="markSchedDirty('${id}')"> Paz</label>
                                     </div>
                                     <div style="display:flex; gap:10px; margin-bottom:10px;">
                                         <div style="flex:1;">
                                             <span style="font-size:11px; color:#94a3b8;">Açılış Saati:</span>
-                                            <input type="time" id="sched_start_${id}" class="edit-input sched-input-${id}" style="width:100%; margin-top:3px;">
+                                            <input type="time" id="sched_start_${id}" class="edit-input sched-input-${id}" style="width:100%; margin-top:3px;" onchange="markSchedDirty('${id}')">
                                         </div>
                                         <div style="flex:1;">
                                             <span style="font-size:11px; color:#94a3b8;">Kapanış Saati:</span>
-                                            <input type="time" id="sched_end_${id}" class="edit-input sched-input-${id}" style="width:100%; margin-top:3px;">
+                                            <input type="time" id="sched_end_${id}" class="edit-input sched-input-${id}" style="width:100%; margin-top:3px;" onchange="markSchedDirty('${id}')">
                                         </div>
                                     </div>
                                     <button class="btn btn-save" style="background:#059669; width:100%;" onclick="saveSchedule('${id}')">Zamanlayıcı Ayarlarını Kaydet</button>
@@ -871,8 +884,9 @@ ADMIN_HTML = """
                             const cb = card.querySelector(`.sched-day-${id}[value="${d}"]`);
                             if (cb) cb.checked = true;
                         });
-                        toggleScheduleUI(id);
+                        toggleScheduleUI(id, true);  // silent = true (dirty işaretlemeden)
                     } else {
+                        // --- Güncelleme ---
                         card.querySelector('.channel-title').innerText = info.name || id;
                         
                         const badgeState = card.querySelector('.badge-state');
@@ -891,29 +905,53 @@ ADMIN_HTML = """
                         btnToggle.innerText = info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ';
                         btnToggle.setAttribute('onclick', `toggleChannel('${id}', ${!info.enabled})`);
 
-                        if (!isInputFocused) {
-                            const inp = card.querySelector('.edit-input');
-                            if (inp.value !== info.url) {
-                                inp.value = info.url;
-                            }
-                            
-                            document.getElementById(`sched_enable_${id}`).checked = info.sched_enabled;
-                            document.getElementById(`sched_start_${id}`).value = info.sched_start;
-                            document.getElementById(`sched_end_${id}`).value = info.sched_end;
-                            
+                        // URL input güncellemesi (kullanıcı yazıyorsa DOKUNMA)
+                        const inp = card.querySelector('.edit-input');
+                        const urlFocused = document.activeElement && document.activeElement.id === inputId;
+                        if (!urlFocused && inp.value !== info.url) {
+                            inp.value = info.url;
+                        }
+
+                        // --- ZAMANLAYICI UI GÜNCELLEMESİ ---
+                        const schedEnableEl = document.getElementById(`sched_enable_${id}`);
+                        const schedStartEl  = document.getElementById(`sched_start_${id}`);
+                        const schedEndEl    = document.getElementById(`sched_end_${id}`);
+
+                        const schedFocused = document.activeElement && (
+                            document.activeElement === schedEnableEl ||
+                            document.activeElement === schedStartEl ||
+                            document.activeElement === schedEndEl ||
+                            (document.activeElement.classList && document.activeElement.classList.contains(`sched-day-${id}`))
+                        );
+
+                        // Kullanıcı schedule alanıyla etkileşimdeyse VEYA dirty ise: sunucu değerleriyle EZME
+                        const userInteracting = schedFocused || card.dataset.schedDirty === "1";
+
+                        if (!userInteracting) {
+                            schedEnableEl.checked = info.sched_enabled;
+                            schedStartEl.value = info.sched_start;
+                            schedEndEl.value = info.sched_end;
                             card.querySelectorAll(`.sched-day-${id}`).forEach(cb => {
                                 cb.checked = info.sched_days.includes(parseInt(cb.value));
                             });
-                            toggleScheduleUI(id);
+                            toggleScheduleUI(id, true);  // silent = true
                         }
                     }
                 }
-            } catch(e) {}
+            } catch(e) { console.error(e); }
         }
 
-        function toggleScheduleUI(id) {
+        function markSchedDirty(id) {
+            const card = document.getElementById(`card_${id}`);
+            if (card) card.dataset.schedDirty = "1";
+        }
+
+        function toggleScheduleUI(id, silent) {
             const enabled = document.getElementById(`sched_enable_${id}`).checked;
             document.getElementById(`sched_fields_${id}`).style.display = enabled ? "flex" : "none";
+            if (!silent) {
+                markSchedDirty(id);
+            }
         }
 
         async function saveSchedule(id) {
@@ -931,6 +969,9 @@ ADMIN_HTML = """
                 const res = await fetch(`/admin/update_schedule?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&enabled=${enabled}&days=${days.join(",")}&start=${start}&end=${end}&_=${Date.now()}`, { cache: 'no-store' });
                 if (res.ok) {
                     showToast('✅ Zamanlayıcı ayarları başarıyla kaydedildi!');
+                    // Dirty bayrağını temizle ki sunucudan gelen taze veri UI'yı güncelleyebilsin
+                    const card = document.getElementById(`card_${id}`);
+                    if (card) card.dataset.schedDirty = "0";
                     setTimeout(loadStatus, 500);
                 } else {
                     showToast('❌ Ayarlar kaydedilemedi!', '#dc2626');
