@@ -202,25 +202,18 @@ scheduler = ScheduleManager(SCHEDULE_FILE)
 # ==================== KANALLAR ====================
 DEFAULT_KANALLAR = [
     {
-        "id": "futbol_tv",
-        "name": "FUTBOL TV",
+        "id": "Sportv1",
+        "name": "NEXT",
         "group": "Spor",
         "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
         "url": "http://nexttr.xyz:8080/live/AbdLk@16729@/V9qK3nRw52La/774257.m3u8"
     },
     {
-        "id": "vavoo",
-        "name": "BEİN SPORTS 1 (vavoo)",
+        "id": "sportv_yedek",
+        "name": "SBOX",
         "group": "Spor",
         "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
         "url": "https://vavoo.to/vavoo-iptv/play/1629878879d81db9a9baa0"
-    },
-    {
-        "id": "bein_sports_1_6817",
-        "name": "BEİN SPORTS 1 (6817)",
-        "group": "Spor",
-        "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
-        "url": "http://0e770a63.ucomist.net/iptv/3HYPASK67VVUSL/6817/index.m3u8"
     }
 ]
 
