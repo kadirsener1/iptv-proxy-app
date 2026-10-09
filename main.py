@@ -296,8 +296,11 @@ def generate_standby_clip(force=False):
             pass
 
     raw_msg = settings.get_standby_message()
-    # FFmpeg drawtext için güvenli hale getir
-    safe_msg = raw_msg.replace("\\", "").replace("'", "").replace(":", " ").replace("\n", "\\n")
+    # drawtext için güvenli hale getir
+    safe_msg = raw_msg.replace("'", "").replace(":", "\\:")
+    # \n -> gerçek satır atlama
+    if "\\n" not in safe_msg and "\n" in safe_msg:
+        safe_msg = safe_msg.replace("\n", "\\n")
 
     cmd = [
         FFMPEG_BIN, "-y",
@@ -311,30 +314,24 @@ def generate_standby_clip(force=False):
     ]
     try:
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=20)
-        if result.returncode == 0 and os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
+        if result.returncode == 0:
             log.info("Standby klibi basariyla olusturuldu.")
-            return
         else:
-            log.warning(f"Standby ilk denemede olusmadi, fallback deneniyor...")
+            log.warning(f"Standby klibi FFmpeg hata kodu: {result.returncode}")
+            # Fallback: basit mesajla tekrar dene
+            fallback_cmd = [
+                FFMPEG_BIN, "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=1280x720:d={}:r=25".format(HLS_TIME),
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-t", str(HLS_TIME),
+                "-vf", "drawtext=text='YAYIN KAPALIDIR':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2",
+                "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-b:v", "35k",
+                "-c:a", "aac", "-b:a", "16k",
+                "-f", "mpegts", STANDBY_TS_PATH
+            ]
+            subprocess.run(fallback_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
     except Exception as e:
-        log.warning(f"Standby ilk deneme hatasi: {e}")
-
-    # Fallback: Çok basit siyah ekran + sabit yazı
-    try:
-        fallback_cmd = [
-            FFMPEG_BIN, "-y",
-            "-f", "lavfi", "-i", "color=c=black:s=1280x720:d={}:r=25".format(HLS_TIME),
-            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-t", str(HLS_TIME),
-            "-vf", "drawtext=text='YAYIN KAPALIDIR':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2",
-            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-b:v", "35k",
-            "-c:a", "aac", "-b:a", "16k",
-            "-f", "mpegts", STANDBY_TS_PATH
-        ]
-        subprocess.run(fallback_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
-        log.info("Standby fallback klibi olusturuldu.")
-    except Exception as e:
-        log.error(f"Standby fallback de basarisiz: {e}")
+        log.warning(f"Standby klibi olusturulamadi: {e}")
 
 
 # ==================== FFMPEG YÖNETİCİSİ ====================
@@ -491,57 +488,47 @@ class StreamManager:
                     await st.start()
 
     async def scheduler_loop(self):
-        """
-        Scheduler sadece tam dakikada (başlangıç/bitiş saati geldiğinde) devreye girer.
-        Manuel aç/kapat işlemine ASLA karışmaz.
-        """
         day_map = {0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"}
-        last_minute_processed = ""
-        
         while True:
             try:
                 now = datetime.now(TR_TZ)
                 current_day = day_map.get(now.weekday(), "mon")
                 current_hm = now.strftime("%H:%M")
-                
-                # Aynı dakikada iki kez çalışmayı önle
-                if current_hm == last_minute_processed:
-                    await asyncio.sleep(10)
-                    continue
-                last_minute_processed = current_hm
 
                 for cid, st in self.streams.items():
                     entries = scheduler.get_list(cid)
                     if not entries:
                         continue
 
+                    should_be_on = False
                     for entry in entries:
                         eday = entry.get("day", "all")
                         if eday != "all" and eday != current_day:
                             continue
-                            
                         estart = entry.get("start", "")
                         eend = entry.get("end", "")
+                        if estart and eend and estart <= current_hm < eend:
+                            should_be_on = True
+                            break
 
-                        # Başlangıç saati GELDİ ise aç
-                        if estart and current_hm == estart:
-                            if not st.enabled:
-                                st.enabled = True
-                                st.touch()
-                                await st.start()
-                                log.info(f"Zamanlayici: {cid} otomatik ACILDI ({current_hm})")
+                    # Sadece zamanlama varsa otomatik aç/kapat
+                    has_active_schedule = any(e.get("start") and e.get("end") for e in entries)
+                    if not has_active_schedule:
+                        continue
 
-                        # Bitiş saati GELDİ ise kapat
-                        if eend and current_hm == eend:
-                            if st.enabled:
-                                st.enabled = False
-                                await st.stop()
-                                log.info(f"Zamanlayici: {cid} otomatik KAPANDI ({current_hm})")
-                                
+                    if should_be_on and not st.enabled:
+                        st.enabled = True
+                        st.touch()
+                        await st.start()
+                        log.info(f"Zamanlayici: {cid} otomatik ACILDI ({current_hm})")
+                    elif not should_be_on and st.enabled and has_active_schedule:
+                        st.enabled = False
+                        await st.stop()
+                        log.info(f"Zamanlayici: {cid} otomatik KAPANDI ({current_hm})")
             except Exception as e:
                 log.warning(f"Scheduler hatasi: {e}")
 
-            await asyncio.sleep(15)
+            await asyncio.sleep(30)
 
 manager = StreamManager()
 
