@@ -5,7 +5,7 @@ FFmpeg tabanlı HLS re-stream proxy (Canlı İzleyici Sayacı & Kalıcı Aylık 
 Geliştirmeler: Kalıcı Toplam Uptime Takibi, Çoklu Kural Zamanlayıcı, Standby Mesajı & Ortam Değişkeni Güvenliği.
 Manuel + Zamanlayıcı birlikte çalışır: Zamanlayıcı kuralı aktifse kanal açık kalır (manuel kapatma geçersiz).
 Buton her zaman EFEKTİF duruma göre çalışır.
-GÜVENLİK: /health public endpoint URL'leri MASKELİ döner. /admin/channels admin key ile AÇIK URL döner.
+GÜVENLİK: /health public endpoint URL'leri TAMAMEN GİZLER (🔒). /admin/channels admin key ile AÇIK URL döner.
 """
 
 import os
@@ -18,7 +18,6 @@ import subprocess
 import logging
 import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 from aiohttp import web
 
 # ==================== AYARLAR & GÜVENLİK ====================
@@ -285,16 +284,8 @@ def get_turkey_now() -> datetime.datetime:
 
 
 def mask_url(url: str) -> str:
-    """URL'yi maskeler: protokol + host kalır, yol/token gizlenir.
-    Örn: http://nexttr.xyz:8080/live/AbdLk@16729@/V9qK3nRw52La/774257.m3u8
-       -> http://nexttr.xyz:8080/••••••"""
-    try:
-        p = urlparse(url)
-        if p.netloc:
-            return f"{p.scheme}://{p.netloc}/••••••"
-        return "••••••"
-    except Exception:
-        return "••••••"
+    """URL'yi tamamen gizler. Host bile gösterilmez."""
+    return "🔒"
 
 
 # ==================== STANDBY EKRANI ====================
@@ -678,7 +669,7 @@ async def handle_standby_segment(request):
 
 
 async def handle_health(request):
-    """Public health endpoint. URL'ler MASKELİ döner."""
+    """Public health endpoint. URL'ler TAMAMEN GİZLİ döner (🔒)."""
     now_tr = get_turkey_now()
     status = {
         "server": {
@@ -698,7 +689,7 @@ async def handle_health(request):
     for cid, st in manager.streams.items():
         status["channels"][cid] = {
             "name": st.ch.get("name", cid),
-            "url": mask_url(st.src),   # <-- MASKELİ URL
+            "url": mask_url(st.src),   # <-- TAMAMEN GİZLİ (🔒)
             "enabled": st.enabled,
             "manual_enabled": st.manual_enabled,
             "sched_forced": manager.is_sched_forced(st),
@@ -1460,7 +1451,7 @@ def make_app():
     app.router.add_get("/health", handle_health)
     app.router.add_get("/admin", handle_admin_page)
     app.router.add_get("/admin/verify", handle_admin_verify)
-    app.router.add_get("/admin/channels", handle_admin_channels)   # <-- YENİ: URL'ler açık (admin only)
+    app.router.add_get("/admin/channels", handle_admin_channels)   # <-- URL'ler açık (admin only)
     app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/admin/update_url", handle_admin_update_url)
     app.router.add_get("/admin/update_standby", handle_admin_update_standby)
