@@ -118,7 +118,7 @@ class ServerState:
                 with open(self.filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.total_uptime_seconds = data.get("total_uptime_seconds", 0.0)
-                    self.standby_message = data.get("standby_message", "YAYIN SU ANDA KAPALIDIR\n\nMac Saatinde Acilacaktir")
+                    self.standby_message = data.get("standby_message", "YAYIN ŞU ANDA KAPALIDIR. Maç Saatinde Açılacaktır.")
             except Exception:
                 pass
 
