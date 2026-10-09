@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 FFmpeg tabanlı HLS re-stream proxy (Canlı İzleyici Sayacı & Kalıcı Aylık Kota Takibi).
+Gelişmiş Gün/Saat Zamanlayıcı Destekli.
 """
 
 import os
@@ -12,6 +13,7 @@ import shutil
 import asyncio
 import subprocess
 import logging
+import datetime
 from pathlib import Path
 from aiohttp import web
 
@@ -35,6 +37,17 @@ IDLE_TIMEOUT   = 100
 STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
 APP_START_TIME = time.time()
+
+# Gün Adı Eşleştirme Sözlüğü
+DAY_MAP = {
+    "pazartesi": 0, "monday": 0,
+    "salı": 1, "tuesday": 1,
+    "çarşamba": 2, "wednesday": 2,
+    "perşembe": 3, "thursday": 3,
+    "cuma": 4, "friday": 4,
+    "cumartesi": 5, "saturday": 5,
+    "pazar": 6, "sunday": 6
+}
 
 
 # ==================== KALICI AYLIK KOTA TAKİPÇİSİ ====================
@@ -106,21 +119,24 @@ DEFAULT_KANALLAR = [
         "name": "FUTBOL TV",
         "group": "Spor",
         "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
-        "url": "http://nexttr.xyz:8080/live/AbdLk@16729@/V9qK3nRw52La/774257.m3u8"
+        "url": "http://nexttr.xyz:8080/live/AbdLk@16729@/V9qK3nRw52La/774257.m3u8",
+        "schedule": []
     },
      {
         "id": "sportv_yedek",
         "name": "SBOX",
         "group": "Spor",
         "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
-        "url": "http://yubsz.dnster.net/live/kadirsener1/Nf9HUKWhdrEuacCm/3264.m3u8"
+        "url": "http://yubsz.dnster.net/live/kadirsener1/Nf9HUKWhdrEuacCm/3264.m3u8",
+        "schedule": []
     },
     {
         "id": "bein_sports_1_6817",
         "name": "BEİN SPORTS 1 (6817)",
         "group": "Spor",
         "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
-        "url": "http://0e770a63.ucomist.net/iptv/3HYPASK67VVUSL/6817/index.m3u8"
+        "url": "http://0e770a63.ucomist.net/iptv/3HYPASK67VVUSL/6817/index.m3u8",
+        "schedule": []
     }
 ]
 
@@ -218,7 +234,8 @@ class ChannelStream:
         self.last_request = 0.0
         self.lock = asyncio.Lock()
         self.started_at = 0.0
-        self.enabled = True
+        self.enabled = channel.get("enabled", True)
+        self.schedule = channel.get("schedule", [])
         self.viewers = {}
 
     def record_viewer(self, ip: str):
@@ -339,18 +356,11 @@ class StreamManager:
         if was_running:
             await st.stop()
         
-        # ANA GÜNCELLEME: Hem src hem de ch["url"] senkron olarak güncellenir
         st.src = new_url
         st.ch["url"] = new_url
         
-        # JSON dosyasına kalıcı olarak kaydet
-        try:
-            channels_data = [s.ch for s in self.streams.values()]
-            with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
-                json.dump(channels_data, f, indent=2, ensure_ascii=False)
-            log.info(f"Kanal URL güncellendi: {cid} -> {new_url}")
-        except Exception as e:
-            log.error(f"Kanallar JSON dosyasına yazılamadı: {e}")
+        await save_channels_to_json()
+        log.info(f"Kanal URL güncellendi: {cid} -> {new_url}")
 
         if was_running and st.enabled:
             await st.start()
@@ -361,7 +371,41 @@ class StreamManager:
         while True:
             await asyncio.sleep(5)
             now = time.time()
+            
+            # --- OTOMATİK ZAMANLAYICI DENETİMİ ---
+            current_dt = datetime.datetime.now()
+            current_weekday = current_dt.weekday()  # 0=Pazartesi, 6=Pazar
+            current_minutes = current_dt.hour * 60 + current_dt.minute
+
             for cid, st in self.streams.items():
+                if st.schedule:
+                    should_be_enabled = False
+                    for item in st.schedule:
+                        day_str = str(item.get("day", "")).lower()
+                        target_weekday = DAY_MAP.get(day_str)
+                        if target_weekday == current_weekday:
+                            try:
+                                sh, sm = map(int, item.get("start", "00:00").split(":"))
+                                eh, em = map(int, item.get("end", "00:00").split(":"))
+                                start_min = sh * 60 + sm
+                                end_min = eh * 60 + em
+                                
+                                if start_min <= current_minutes <= end_min:
+                                    should_be_enabled = True
+                                    break
+                            except Exception:
+                                continue
+                    
+                    if st.enabled != should_be_enabled:
+                        st.enabled = should_be_enabled
+                        log.info(f"Zamanlayıcı Tetiklendi ({cid}): Yayın otomatik olarak {'AÇILDI' if st.enabled else 'KAPATILDI'}.")
+                        if not st.enabled:
+                            await st.stop()
+                        else:
+                            st.touch()
+                            await st.start()
+                
+                # --- KLASİK BOŞTA KALMA / ÇALIŞMA DENETİMLERİ ---
                 if not st.enabled and st.is_alive():
                     await st.stop()
                 elif st.is_alive() and st.last_request and (now - st.last_request) > IDLE_TIMEOUT:
@@ -370,6 +414,21 @@ class StreamManager:
                     await st.start()
 
 manager = StreamManager()
+
+
+async def save_channels_to_json():
+    """Tüm kanalların güncel durumunu JSON dosyasına yazar."""
+    try:
+        channels_data = []
+        for s in manager.streams.values():
+            s.ch["url"] = s.src
+            s.ch["enabled"] = s.enabled
+            s.ch["schedule"] = s.schedule
+            channels_data.append(s.ch)
+        with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(channels_data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log.error(f"Kanallar JSON dosyasına kaydedilemedi: {e}")
 
 
 # ==================== HTTP HANDLER'LAR ====================
@@ -484,9 +543,9 @@ async def handle_health(request):
             "enabled": st.enabled,
             "running": st.is_alive(),
             "ready": st.playlist_ready(),
-            "viewers": st.get_viewer_count()
+            "viewers": st.get_viewer_count(),
+            "schedule": st.schedule
         }
-    # ÖNEMLİ: Tarayıcı önbelleklemesini engelle
     return web.json_response(status, headers=NO_CACHE_HEADERS)
 
 
@@ -522,6 +581,8 @@ ADMIN_HTML = """
         .edit-input { flex: 1; padding: 8px 10px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #cbd5e1; font-size: 13px; }
         .btn-save { background: #3b82f6; font-size: 12px; padding: 6px 12px; }
         .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #16a34a; color: white; padding: 12px 24px; border-radius: 8px; z-index: 9999; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+        .sched-item { display: flex; justify-content: space-between; align-items: center; background: #0f172a; padding: 5px 10px; border-radius: 6px; font-size: 12px; margin-bottom: 4px; }
+        .sched-del { color: #ef4444; cursor: pointer; font-weight: bold; padding: 0 4px; }
     </style>
 </head>
 <body>
@@ -623,7 +684,6 @@ ADMIN_HTML = """
 
         async function loadStatus() {
             try {
-                // Cache busting ile veri çek
                 const res = await fetch(`/health?_=${Date.now()}`, { cache: 'no-store' });
                 if (!res.ok) return;
                 const data = await res.json();
@@ -673,6 +733,27 @@ ADMIN_HTML = """
                                 <input type="text" id="${inputId}" class="edit-input" value="${info.url}" placeholder="Yayın (.m3u8) Linki">
                                 <button class="btn btn-save" onclick="updateChannelUrl('${id}')">Kaydet</button>
                             </div>
+
+                            <!-- ZAMANLAYICI ALANI -->
+                            <div class="schedule-section" style="margin-top: 15px; border-top: 1px dashed #475569; padding-top: 10px;">
+                                <h4 style="margin: 0 0 8px 0; color: #38bdf8; font-size: 13px;">📅 Otomatik Yayın Zamanlayıcı (Çoklu Giriş Destekler)</h4>
+                                <div id="sched_list_${id}" style="margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px;"></div>
+                                <div style="display:flex; gap: 5px; align-items:center; flex-wrap: wrap;">
+                                    <select id="sched_day_${id}" style="padding: 6px; border-radius: 6px; background:#0f172a; color:white; border:1px solid #475569; font-size: 12px;">
+                                        <option value="Pazartesi">Pazartesi</option>
+                                        <option value="Salı">Salı</option>
+                                        <option value="Çarşamba">Çarşamba</option>
+                                        <option value="Perşembe">Perşembe</option>
+                                        <option value="Cuma">Cuma</option>
+                                        <option value="Cumartesi">Cumartesi</option>
+                                        <option value="Pazar">Pazar</option>
+                                    </select>
+                                    <input type="text" id="sched_start_${id}" placeholder="19:00" style="width:45px; padding: 6px; border-radius: 6px; background:#0f172a; color:white; border:1px solid #475569; font-size: 12px; text-align:center;">
+                                    <span style="color:#94a3b8; font-size:11px;">ile</span>
+                                    <input type="text" id="sched_end_${id}" placeholder="21:30" style="width:45px; padding: 6px; border-radius: 6px; background:#0f172a; color:white; border:1px solid #475569; font-size: 12px; text-align:center;">
+                                    <button class="btn btn-save" style="padding: 6px 10px; background:#10b981;" onclick="addSchedule('${id}')">Zaman Ekle</button>
+                                </div>
+                            </div>
                         `;
                     } else {
                         card.querySelector('.channel-title').innerText = info.name || id;
@@ -693,13 +774,31 @@ ADMIN_HTML = """
                         btnToggle.innerText = info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ';
                         btnToggle.setAttribute('onclick', `toggleChannel('${id}', ${!info.enabled})`);
 
-                        // Sadece input alanına dokunulmadığı zaman değeri güncelle
                         if (!isInputFocused) {
                             const inp = card.querySelector('.edit-input');
                             if (inp.value !== info.url) {
                                 inp.value = info.url;
                             }
                         }
+                    }
+
+                    // Zamanlayıcı Listesini Güncelle
+                    const listContainer = card.querySelector(`#sched_list_${id}`);
+                    if (listContainer) {
+                        let listHtml = "";
+                        if (info.schedule && info.schedule.length > 0) {
+                            info.schedule.forEach((item, index) => {
+                                listHtml += `
+                                    <div class="sched-item">
+                                        <span>🟢 <b>${item.day}</b>: ${item.start} - ${item.end}</span>
+                                        <span class="sched-del" onclick="deleteSchedule('${id}', ${index})">❌ Sil</span>
+                                    </div>
+                                `;
+                            });
+                        } else {
+                            listHtml = `<div style="color:#94a3b8; font-size:11px; font-style:italic;">Otomatik zamanlayıcı ayarlanmamış. Yayın 7/24 veya manuel kontrol edilir.</div>`;
+                        }
+                        listContainer.innerHTML = listHtml;
                     }
                 }
             } catch(e) {}
@@ -729,11 +828,9 @@ ADMIN_HTML = """
                 const res = await fetch(`/admin/update_url?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&url=${encodeURIComponent(newUrl)}&_=${Date.now()}`, { cache: 'no-store' });
                 if (res.ok) {
                     const data = await res.json();
-                    // Önce input'a yeni URL'yi atayıp odağı kaldır
                     inputEl.value = data.url || newUrl;
                     inputEl.blur();
                     showToast('✅ Yayın linki başarıyla güncellendi!');
-                    // Durumu yenile
                     setTimeout(loadStatus, 800);
                 } else {
                     showToast('❌ Hata oluştu veya yetkisiz!', '#dc2626');
@@ -741,6 +838,50 @@ ADMIN_HTML = """
                 }
             } catch(e) {
                 showToast('❌ Bağlantı hatası: ' + e.message, '#dc2626');
+            }
+        }
+
+        async function addSchedule(id) {
+            const key = getStoredKey();
+            const day = document.getElementById(`sched_day_${id}`).value;
+            const start = document.getElementById(`sched_start_${id}`).value.trim();
+            const end = document.getElementById(`sched_end_${id}`).value.trim();
+
+            const timeRegex = /^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$/;
+            if (!timeRegex.test(start) || !timeRegex.test(end)) {
+                showToast("❌ Saat formatı SS:DD (örn: 19:30) olmalıdır!", "#dc2626");
+                return;
+            }
+
+            try {
+                const res = await fetch(`/admin/add_schedule?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&day=${encodeURIComponent(day)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&_=${Date.now()}`, { cache: 'no-store' });
+                if (res.ok) {
+                    showToast("✅ Zamanlama başarıyla eklendi!");
+                    document.getElementById(`sched_start_${id}`).value = "";
+                    document.getElementById(`sched_end_${id}`).value = "";
+                    setTimeout(loadStatus, 500);
+                } else {
+                    const txt = await res.text();
+                    showToast("❌ Hata: " + txt, "#dc2626");
+                }
+            } catch (e) {
+                showToast("❌ Bağlantı hatası: " + e.message, "#dc2626");
+            }
+        }
+
+        async function deleteSchedule(id, index) {
+            if (!confirm("Bu zamanlamayı silmek istediğinize emin misiniz?")) return;
+            const key = getStoredKey();
+            try {
+                const res = await fetch(`/admin/delete_schedule?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&index=${index}&_=${Date.now()}`, { cache: 'no-store' });
+                if (res.ok) {
+                    showToast("✅ Zamanlama silindi!");
+                    setTimeout(loadStatus, 500);
+                } else {
+                    showToast("❌ Silme işlemi başarısız!", "#dc2626");
+                }
+            } catch (e) {
+                showToast("❌ Bağlantı hatası: " + e.message, "#dc2626");
             }
         }
 
@@ -785,6 +926,8 @@ async def handle_admin_toggle(request):
         return web.Response(status=404, text="Kanal Bulunamadı")
 
     st.enabled = enable
+    await save_channels_to_json()
+
     if not enable:
         await st.stop()
     else:
@@ -814,12 +957,71 @@ async def handle_admin_update_url(request):
     if not success:
         return web.Response(status=500, text="Güncelleme başarısız")
     
-    # Güncel URL'yi geri döndür (frontend doğrulamak için)
     return web.json_response({
         "success": True, 
         "id": cid, 
-        "url": st.src  # Backend'deki güncel değeri döndür
+        "url": st.src  
     }, headers=NO_CACHE_HEADERS)
+
+
+async def handle_admin_add_schedule(request):
+    """Kanala yeni bir otomatik zaman dilimi ekler"""
+    key = request.query.get("key")
+    cid = request.query.get("id")
+    day = request.query.get("day")
+    start = request.query.get("start")
+    end = request.query.get("end")
+
+    if key != ADMIN_KEY:
+        return web.Response(status=401, text="Yetkisiz Erişim")
+
+    st = manager.get(cid)
+    if not st:
+        return web.Response(status=404, text="Kanal Bulunamadı")
+
+    if not day or not start or not end:
+        return web.Response(status=400, text="Eksik Parametre")
+
+    time_re = re.compile(r"^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$")
+    if not time_re.match(start) or not time_re.match(end):
+        return web.Response(status=400, text="Geçersiz Saat Formatı (Örn: 19:00)")
+
+    if day.lower() not in DAY_MAP:
+        return web.Response(status=400, text="Geçersiz Gün")
+
+    new_entry = {
+        "day": day.capitalize(),
+        "start": start,
+        "end": end
+    }
+    
+    st.schedule.append(new_entry)
+    await save_channels_to_json()
+    return web.json_response({"success": True, "schedule": st.schedule}, headers=NO_CACHE_HEADERS)
+
+
+async def handle_admin_delete_schedule(request):
+    """Kanaldaki kayıtlı bir zaman dilimini siler"""
+    key = request.query.get("key")
+    cid = request.query.get("id")
+    try:
+        index = int(request.query.get("index", -1))
+    except ValueError:
+        return web.Response(status=400, text="Geçersiz İndeks")
+
+    if key != ADMIN_KEY:
+        return web.Response(status=401, text="Yetkisiz Erişim")
+
+    st = manager.get(cid)
+    if not st:
+        return web.Response(status=404, text="Kanal Bulunamadı")
+
+    if index < 0 or index >= len(st.schedule):
+        return web.Response(status=400, text="İndeks Limit Dışı")
+
+    st.schedule.pop(index)
+    await save_channels_to_json()
+    return web.json_response({"success": True, "schedule": st.schedule}, headers=NO_CACHE_HEADERS)
 
 
 # ==================== APP ====================
@@ -828,7 +1030,7 @@ async def on_startup(app):
     generate_standby_clip()
     app["monitor_task"] = asyncio.create_task(manager.monitor())
     app["save_task"] = asyncio.create_task(tracker.periodic_save())
-    log.info("IPTV HLS Re-stream Proxy başlatıldı.")
+    log.info("IPTV HLS Re-stream Proxy ve Otomatik Zamanlayıcı başarıyla başlatıldı.")
 
 async def on_cleanup(app):
     tracker.save()
@@ -847,6 +1049,8 @@ def make_app():
     app.router.add_get("/admin/verify", handle_admin_verify)
     app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/admin/update_url", handle_admin_update_url)
+    app.router.add_get("/admin/add_schedule", handle_admin_add_schedule)
+    app.router.add_get("/admin/delete_schedule", handle_admin_delete_schedule)
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
     app.router.add_get("/hls/standby/seg.ts", handle_standby_segment)
     app.router.add_get("/hls/{channel_id}/{name}", handle_segment)
