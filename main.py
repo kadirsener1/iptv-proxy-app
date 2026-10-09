@@ -213,7 +213,7 @@ DEFAULT_KANALLAR = [
         "name": "SBOX",
         "group": "Spor",
         "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
-        "url": "https://vavoo.to/vavoo-iptv/play/1629878879d81db9a9baa0"
+        "url": "http://yubsz.dnster.net/live/kadirsener1/Nf9HUKWhdrEuacCm/3264.m3u8"
     }
 ]
 
