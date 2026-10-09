@@ -32,8 +32,8 @@ STATE_FILE      = os.environ.get("STATE_FILE", str(BASE_DIR / "server_state.json
 HLS_BASE_DIR = "/tmp/iptv_hls"
 STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 
-HLS_TIME       = 4
-HLS_LIST_SIZE  = 20
+HLS_TIME       = 5
+HLS_LIST_SIZE  = 12
 IDLE_TIMEOUT   = 100
 STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
