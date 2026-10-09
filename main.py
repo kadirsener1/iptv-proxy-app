@@ -170,10 +170,10 @@ DEFAULT_KANALLAR = [
     },
     {
         "id": "sportv_yedek",
-        "name": "SBOX",
+        "name": "Yedek",
         "group": "Spor",
         "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
-        "url": os.environ.get("URL_SBOX", "http://varsayilan-yayin-adresi.m3u8")
+        "url": os.environ.get("URL_YDK", "http://varsayilan-yayin-adresi.m3u8")
     },
     {
         "id": "bein_sports_1_6817",
