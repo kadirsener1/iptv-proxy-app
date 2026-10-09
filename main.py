@@ -33,7 +33,7 @@ HLS_BASE_DIR = "/tmp/iptv_hls"
 STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 
 HLS_TIME       = 4
-HLS_LIST_SIZE  = 15
+HLS_LIST_SIZE  = 10
 IDLE_TIMEOUT   = 100
 STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
