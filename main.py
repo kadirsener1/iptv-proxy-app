@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 FFmpeg tabanlı HLS re-stream proxy (Canlı İzleyici Sayacı & Kalıcı Aylık Kota Takibi).
-Gelişmiş Gün/Saat Zamanlayıcı Destekli.
+Gelişmiş Gün/Saat Zamanlayıcı Destekli (Türkiye Saat Dilimi Uyumlu).
 """
 
 import os
@@ -48,6 +48,21 @@ DAY_MAP = {
     "cumartesi": 5, "saturday": 5,
     "pazar": 6, "sunday": 6
 }
+
+def normalize_day(day_name: str) -> str:
+    """Türkçe karakterleri güvenli bir şekilde küçük harfe dönüştürür."""
+    if not day_name:
+        return ""
+    day_name = day_name.strip()
+    mapping = {
+        "İ": "i", "I": "ı", "Ş": "ş", "ş": "ş",
+        "Ç": "ç", "ç": "ç", "Ö": "ö", "ö": "ö",
+        "Ü": "ü", "ü": "ü", "Ğ": "ğ", "ğ": "ğ"
+    }
+    res = []
+    for char in day_name:
+        res.append(mapping.get(char, char.lower()))
+    return "".join(res)
 
 
 # ==================== KALICI AYLIK KOTA TAKİPÇİSİ ====================
@@ -372,16 +387,19 @@ class StreamManager:
             await asyncio.sleep(5)
             now = time.time()
             
-            # --- OTOMATİK ZAMANLAYICI DENETİMİ ---
-            current_dt = datetime.datetime.now()
+            # Sunucu nerede barındırılırsa barındırılsın TÜRKİYE saat dilimine (UTC+3) sabitlendi.
+            tz_tr = datetime.timezone(datetime.timedelta(hours=3))
+            current_dt = datetime.datetime.now(tz_tr)
             current_weekday = current_dt.weekday()  # 0=Pazartesi, 6=Pazar
             current_minutes = current_dt.hour * 60 + current_dt.minute
 
             for cid, st in self.streams.items():
+                in_schedule_slot = False
+                
+                # --- OTOMATİK ZAMANLAYICI DENETİMİ ---
                 if st.schedule:
-                    should_be_enabled = False
                     for item in st.schedule:
-                        day_str = str(item.get("day", "")).lower()
+                        day_str = normalize_day(str(item.get("day", "")))
                         target_weekday = DAY_MAP.get(day_str)
                         if target_weekday == current_weekday:
                             try:
@@ -390,28 +408,43 @@ class StreamManager:
                                 start_min = sh * 60 + sm
                                 end_min = eh * 60 + em
                                 
+                                # Şimdiki zaman bu aralıkta mı?
                                 if start_min <= current_minutes <= end_min:
-                                    should_be_enabled = True
+                                    in_schedule_slot = True
                                     break
-                            except Exception:
+                            except Exception as e:
+                                log.warning(f"Zamanlama format ayrıştırma hatası ({cid}): {e}")
                                 continue
                     
-                    if st.enabled != should_be_enabled:
-                        st.enabled = should_be_enabled
+                    # Eğer durum değiştiyse tetikle ve kaydet
+                    if st.enabled != in_schedule_slot:
+                        st.enabled = in_schedule_slot
                         log.info(f"Zamanlayıcı Tetiklendi ({cid}): Yayın otomatik olarak {'AÇILDI' if st.enabled else 'KAPATILDI'}.")
+                        await save_channels_to_json()
                         if not st.enabled:
                             await st.stop()
                         else:
                             st.touch()
                             await st.start()
                 
-                # --- KLASİK BOŞTA KALMA / ÇALIŞMA DENETİMLERİ ---
-                if not st.enabled and st.is_alive():
-                    await st.stop()
-                elif st.is_alive() and st.last_request and (now - st.last_request) > IDLE_TIMEOUT:
-                    await st.stop()
-                elif (not st.is_alive()) and st.enabled and st.last_request and (now - st.last_request) < IDLE_TIMEOUT:
-                    await st.start()
+                # --- ÇALIŞMA / DURDURMA DENETİMLERİ ---
+                if not st.enabled:
+                    # Yayın kapalıysa FFmpeg kesinlikle kapalı kalmalı
+                    if st.is_alive():
+                        await st.stop()
+                else:
+                    # Yayın açık ise (Enabled)
+                    if st.schedule and in_schedule_slot:
+                        # Eğer zamanlayıcı dilimindeysek: Kesintisiz çalışmalı (Pre-start & No idle timeout)
+                        if not st.is_alive():
+                            await st.start()
+                    else:
+                        # Zamanlama tanımlanmamışsa (Manuel mod) ya da zamanlama dışı normal süreçte ise:
+                        # Orijinal izleyici tabanlı otomatik durma / açılma (Idle Timeout) devrededir.
+                        if st.is_alive() and st.last_request and (now - st.last_request) > IDLE_TIMEOUT:
+                            await st.stop()
+                        elif (not st.is_alive()) and st.last_request and (now - st.last_request) < IDLE_TIMEOUT:
+                            await st.start()
 
 manager = StreamManager()
 
@@ -782,7 +815,7 @@ ADMIN_HTML = """
                         }
                     }
 
-                    // Zamanlayıcı Listesini Güncelle
+                    // Zamanlayıcı Listesini Çiz
                     const listContainer = card.querySelector(`#sched_list_${id}`);
                     if (listContainer) {
                         let listHtml = "";
@@ -796,7 +829,7 @@ ADMIN_HTML = """
                                 `;
                             });
                         } else {
-                            listHtml = `<div style="color:#94a3b8; font-size:11px; font-style:italic;">Otomatik zamanlayıcı ayarlanmamış. Yayın 7/24 veya manuel kontrol edilir.</div>`;
+                            listHtml = `<div style="color:#94a3b8; font-size:11px; font-style:italic;">Zamanlama ayarlanmamış. Yayın 7/24 veya manuel kontrol edilir.</div>`;
                         }
                         listContainer.innerHTML = listHtml;
                     }
@@ -986,7 +1019,8 @@ async def handle_admin_add_schedule(request):
     if not time_re.match(start) or not time_re.match(end):
         return web.Response(status=400, text="Geçersiz Saat Formatı (Örn: 19:00)")
 
-    if day.lower() not in DAY_MAP:
+    normalized_day_str = normalize_day(day)
+    if normalized_day_str not in DAY_MAP:
         return web.Response(status=400, text="Geçersiz Gün")
 
     new_entry = {
