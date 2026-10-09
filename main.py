@@ -109,6 +109,13 @@ DEFAULT_KANALLAR = [
         "url": "http://nexttr.xyz:8080/live/AbdLk@16729@/V9qK3nRw52La/774257.m3u8"
     },
     {
+        "id": "vavoo",
+        "name": "BEİN SPORTS 1 (vavoo)",
+        "group": "Spor",
+        "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
+        "url": "https://vavoo.to/vavoo-iptv/play/1629878879d81db9a9baa0"
+    },
+    {
         "id": "bein_sports_1_6817",
         "name": "BEİN SPORTS 1 (6817)",
         "group": "Spor",
