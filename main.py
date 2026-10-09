@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 FFmpeg tabanlı HLS re-stream proxy (Canlı İzleyici Sayacı & Kalıcı Aylık Kota Takibi).
-Gelişmiş Gün/Saat Zamanlayıcı Destekli (Türkiye Saat Dilimi Uyumlu).
+Geliştirmeler: Kalıcı Toplam Uptime Takibi, Kanal Zamanlayıcı, Standby Mesajı & Ortam Değişkeni Güvenliği.
 """
 
 import os
@@ -17,52 +17,27 @@ import datetime
 from pathlib import Path
 from aiohttp import web
 
-# ==================== AYARLAR ====================
+# ==================== AYARLAR & GÜVENLİK ====================
 BIND_HOST    = "0.0.0.0"
 PROXY_PORT   = int(os.environ.get("PORT", 8080))
-ADMIN_KEY    = os.environ.get("ADMIN_KEY", "admin123")  # ŞİFRENİZ
+ADMIN_KEY    = os.environ.get("ADMIN_KEY", "admin123")  # Render Environment'tan okunur
 
 BASE_DIR = Path(__file__).resolve().parent
 LOCAL_M3U_PATH  = os.environ.get("LOCAL_M3U_PATH", str(BASE_DIR / "playlist.m3u"))
 LOCAL_JSON_PATH = os.environ.get("LOCAL_JSON_PATH", str(BASE_DIR / "channels.json"))
 LOG_DIR         = os.environ.get("LOG_DIR", str(BASE_DIR / "logs"))
 USAGE_FILE      = os.environ.get("USAGE_FILE", str(BASE_DIR / "bandwidth_usage.json"))
+STATE_FILE      = os.environ.get("STATE_FILE", str(BASE_DIR / "server_state.json"))
 
 HLS_BASE_DIR = "/tmp/iptv_hls"
 STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 
 HLS_TIME       = 4
-HLS_LIST_SIZE  = 15
+HLS_LIST_SIZE  = 12
 IDLE_TIMEOUT   = 100
 STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
 APP_START_TIME = time.time()
-
-# Gün Adı Eşleştirme Sözlüğü
-DAY_MAP = {
-    "pazartesi": 0, "monday": 0,
-    "salı": 1, "tuesday": 1,
-    "çarşamba": 2, "wednesday": 2,
-    "perşembe": 3, "thursday": 3,
-    "cuma": 4, "friday": 4,
-    "cumartesi": 5, "saturday": 5,
-    "pazar": 6, "sunday": 6
-}
-
-def normalize_day(day_name: str) -> str:
-    """Türkçe karakterleri güvenli bir şekilde küçük harfe dönüştürür."""
-    if not day_name:
-        return ""
-    day_name = day_name.strip()
-    mapping = {
-        "İ": "i", "I": "ı", "Ş": "ş", "ş": "ş",
-        "Ç": "ç", "ç": "ç", "Ö": "ö", "ö": "ö",
-        "Ü": "ü", "ü": "ü", "Ğ": "ğ", "ğ": "ğ"
-    }
-    res = []
-    for char in day_name:
-        res.append(mapping.get(char, char.lower()))
-    return "".join(res)
 
 
 # ==================== KALICI AYLIK KOTA TAKİPÇİSİ ====================
@@ -127,45 +102,105 @@ class BandwidthTracker:
 tracker = BandwidthTracker(USAGE_FILE)
 
 
-# ==================== KANALLAR (DİNAMİK JSON DESTEKLİ) ====================
+# ==================== SUNUCU DURUMU & UPTIME KONTROLÜ ====================
+class ServerState:
+    """Sunucu açık kalma süresi ve özelleştirilmiş standby mesajlarını saklar."""
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.total_uptime_seconds = 0.0
+        self.standby_message = "YAYIN SU ANDA KAPALIDIR\n\nMac Saatinde Acilacaktir"
+        self.last_save_time = time.time()
+        self.load()
+
+    def load(self):
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.total_uptime_seconds = data.get("total_uptime_seconds", 0.0)
+                    self.standby_message = data.get("standby_message", "YAYIN SU ANDA KAPALIDIR\n\nMac Saatinde Acilacaktir")
+            except Exception:
+                pass
+
+    def save(self):
+        try:
+            with open(self.filepath, "w", encoding="utf-8") as f:
+                json.dump({
+                    "total_uptime_seconds": self.total_uptime_seconds,
+                    "standby_message": self.standby_message
+                }, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            log.warning(f"Sunucu durumu kaydedilemedi: {e}")
+
+server_state = ServerState(STATE_FILE)
+
+async def uptime_tracker_task():
+    """Periyodik olarak sunucunun toplam çalışma süresini günceller ve kaydeder."""
+    while True:
+        await asyncio.sleep(10)
+        now = time.time()
+        elapsed = now - server_state.last_save_time
+        server_state.total_uptime_seconds += elapsed
+        server_state.last_save_time = now
+        server_state.save()
+
+def format_uptime(seconds: float) -> str:
+    """Saniyeyi gün, saat ve dakikaya dönüştürür."""
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    parts = []
+    if days > 0:
+        parts.append(f"{days} Gün")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours} Saat")
+    parts.append(f"{minutes} Dk")
+    return " ".join(parts) if parts else "0 Dk"
+
+
+# ==================== KANALLAR (GİZLİ ORTAM DEĞİŞKENLİ) ====================
+# Linkler Render.com Environment'tan çekilir, GitHub'da görünmez!
 DEFAULT_KANALLAR = [
     {
         "id": "futbol_tv",
         "name": "FUTBOL TV",
         "group": "Spor",
         "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
-        "url": "http://nexttr.xyz:8080/live/AbdLk@16729@/V9qK3nRw52La/774257.m3u8",
-        "schedule": []
+        "url": os.environ.get("URL_FUTBOL_TV", "http://varsayilan-yayin-adresi.m3u8")
     },
-     {
+    {
         "id": "sportv_yedek",
         "name": "SBOX",
         "group": "Spor",
         "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
-        "url": "http://yubsz.dnster.net/live/kadirsener1/Nf9HUKWhdrEuacCm/3264.m3u8",
-        "schedule": []
+        "url": os.environ.get("URL_SBOX", "http://varsayilan-yayin-adresi.m3u8")
     },
     {
         "id": "bein_sports_1_6817",
         "name": "BEİN SPORTS 1 (6817)",
         "group": "Spor",
         "logo": "https://raw.githubusercontent.com/kadirsener1/tvmyeni/refs/heads/main/bg.JPG",
-        "url": "http://0e770a63.ucomist.net/iptv/3HYPASK67VVUSL/6817/index.m3u8",
-        "schedule": []
+        "url": os.environ.get("URL_BEIN_6817", "http://varsayilan-yayin-adresi.m3u8")
     }
 ]
 
 def load_dynamic_channels():
-    """Kanalları JSON dosyasından yükler, yoksa varsayılanları oluşturur."""
+    """Kanalları JSON dosyasından yükler, yoksa ortam değişkenlerinden varsayılanları oluşturur."""
     if os.path.exists(LOCAL_JSON_PATH):
         try:
             with open(LOCAL_JSON_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                saved = json.load(f)
+                # Eksik kanal varsa ortam değişkenleriyle tamamla
+                saved_ids = {c["id"] for c in saved}
+                for def_ch in DEFAULT_KANALLAR:
+                    if def_ch["id"] not in saved_ids:
+                        saved.append(def_ch)
+                return saved
         except Exception as e:
             log.warning(f"Kanallar JSON dosyasından yüklenemedi: {e}")
     try:
         with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_KANALLAR, f, indent=2)
+            json.dump(DEFAULT_KANALLAR, f, indent=2, ensure_ascii=False)
     except Exception as e:
         log.warning(f"Varsayılan kanallar yazılamadı: {e}")
     return DEFAULT_KANALLAR
@@ -218,24 +253,65 @@ def get_memory_usage_mb():
 
 
 # ==================== STANDBY EKRANI ====================
-def generate_standby_clip():
-    if os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
+def generate_standby_clip(force=False):
+    if not force and os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
         return
     os.makedirs(HLS_BASE_DIR, exist_ok=True)
+
+    text_file_path = os.path.join(HLS_BASE_DIR, "standby_text.txt")
+    try:
+        with open(text_file_path, "w", encoding="utf-8") as f:
+            f.write(server_state.standby_message)
+    except Exception as e:
+        log.warning(f"Standby metin dosyası yazılamadı: {e}")
+
+    text_file_path_ff = text_file_path.replace('\\', '/').replace(':', '\\:')
+
     cmd = [
         FFMPEG_BIN, "-y",
         "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={HLS_TIME}:r=25",
         "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
         "-t", str(HLS_TIME),
-        "-vf", "drawtext=text='YAYIN SU ANDA KAPALIDIR\\n\\nMac Saatinde Acilacaktir':fontcolor=white:fontsize=44:x=(w-text_w)/2:y=(h-text_h)/2",
+        "-vf", f"drawtext=textfile='{text_file_path_ff}':fontcolor=white:fontsize=44:x=(w-text_w)/2:y=(h-text_h)/2",
         "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-b:v", "35k",
         "-c:a", "aac", "-b:a", "16k",
         "-f", "mpegts", STANDBY_TS_PATH
     ]
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        log.info("Standby klibi başarıyla oluşturuldu/güncellendi.")
     except Exception as e:
         log.warning(f"Standby klibi oluşturulamadı: {e}")
+
+
+# ==================== OTO-ZAMANLAYICI KONTROLÜ ====================
+def check_schedule(st) -> bool | None:
+    if not st.ch.get("sched_enabled", False):
+        return None
+
+    now = datetime.datetime.now()
+    day_of_week = now.weekday()
+    sched_days = st.ch.get("sched_days", [])
+
+    if day_of_week not in sched_days:
+        return False
+
+    start_str = st.ch.get("sched_start", "00:00")
+    end_str = st.ch.get("sched_end", "00:00")
+
+    try:
+        sh, sm = map(int, start_str.split(":"))
+        eh, em = map(int, end_str.split(":"))
+        now_minutes = now.hour * 60 + now.minute
+        start_minutes = sh * 60 + sm
+        end_minutes = eh * 60 + em
+
+        if start_minutes <= end_minutes:
+            return start_minutes <= now_minutes < end_minutes
+        else:
+            return now_minutes >= start_minutes or now_minutes < end_minutes
+    except Exception:
+        return False
 
 
 # ==================== FFMPEG YÖNETİCİSİ ====================
@@ -250,7 +326,6 @@ class ChannelStream:
         self.lock = asyncio.Lock()
         self.started_at = 0.0
         self.enabled = channel.get("enabled", True)
-        self.schedule = channel.get("schedule", [])
         self.viewers = {}
 
     def record_viewer(self, ip: str):
@@ -362,7 +437,6 @@ class StreamManager:
         return st
 
     async def update_channel_url(self, cid: str, new_url: str) -> bool:
-        """Kanal URL adresini dinamik olarak günceller ve kaydeder."""
         st = self.streams.get(cid)
         if not st:
             return False
@@ -374,8 +448,13 @@ class StreamManager:
         st.src = new_url
         st.ch["url"] = new_url
         
-        await save_channels_to_json()
-        log.info(f"Kanal URL güncellendi: {cid} -> {new_url}")
+        try:
+            channels_data = [s.ch for s in self.streams.values()]
+            with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(channels_data, f, indent=2, ensure_ascii=False)
+            log.info(f"Kanal URL güncellendi: {cid} -> {new_url}")
+        except Exception as e:
+            log.error(f"Kanallar JSON dosyasına yazılamadı: {e}")
 
         if was_running and st.enabled:
             await st.start()
@@ -386,82 +465,27 @@ class StreamManager:
         while True:
             await asyncio.sleep(5)
             now = time.time()
-            
-            # Sunucu nerede barındırılırsa barındırılsın TÜRKİYE saat dilimine (UTC+3) sabitlendi.
-            tz_tr = datetime.timezone(datetime.timedelta(hours=3))
-            current_dt = datetime.datetime.now(tz_tr)
-            current_weekday = current_dt.weekday()  # 0=Pazartesi, 6=Pazar
-            current_minutes = current_dt.hour * 60 + current_dt.minute
-
             for cid, st in self.streams.items():
-                in_schedule_slot = False
-                
-                # --- OTOMATİK ZAMANLAYICI DENETİMİ ---
-                if st.schedule:
-                    for item in st.schedule:
-                        day_str = normalize_day(str(item.get("day", "")))
-                        target_weekday = DAY_MAP.get(day_str)
-                        if target_weekday == current_weekday:
-                            try:
-                                sh, sm = map(int, item.get("start", "00:00").split(":"))
-                                eh, em = map(int, item.get("end", "00:00").split(":"))
-                                start_min = sh * 60 + sm
-                                end_min = eh * 60 + em
-                                
-                                # Şimdiki zaman bu aralıkta mı?
-                                if start_min <= current_minutes <= end_min:
-                                    in_schedule_slot = True
-                                    break
-                            except Exception as e:
-                                log.warning(f"Zamanlama format ayrıştırma hatası ({cid}): {e}")
-                                continue
-                    
-                    # Eğer durum değiştiyse tetikle ve kaydet
-                    if st.enabled != in_schedule_slot:
-                        st.enabled = in_schedule_slot
-                        log.info(f"Zamanlayıcı Tetiklendi ({cid}): Yayın otomatik olarak {'AÇILDI' if st.enabled else 'KAPATILDI'}.")
-                        await save_channels_to_json()
-                        if not st.enabled:
-                            await st.stop()
-                        else:
-                            st.touch()
-                            await st.start()
-                
-                # --- ÇALIŞMA / DURDURMA DENETİMLERİ ---
-                if not st.enabled:
-                    # Yayın kapalıysa FFmpeg kesinlikle kapalı kalmalı
-                    if st.is_alive():
+                sched_state = check_schedule(st)
+                if sched_state is not None:
+                    if sched_state and not st.enabled:
+                        st.enabled = True
+                        st.touch()
+                        await st.start()
+                        log.info(f"[Zamanlayıcı] {cid} yayını otomatik olarak BAŞLATILDI.")
+                    elif not sched_state and st.enabled:
+                        st.enabled = False
                         await st.stop()
-                else:
-                    # Yayın açık ise (Enabled)
-                    if st.schedule and in_schedule_slot:
-                        # Eğer zamanlayıcı dilimindeysek: Kesintisiz çalışmalı (Pre-start & No idle timeout)
-                        if not st.is_alive():
-                            await st.start()
-                    else:
-                        # Zamanlama tanımlanmamışsa (Manuel mod) ya da zamanlama dışı normal süreçte ise:
-                        # Orijinal izleyici tabanlı otomatik durma / açılma (Idle Timeout) devrededir.
-                        if st.is_alive() and st.last_request and (now - st.last_request) > IDLE_TIMEOUT:
-                            await st.stop()
-                        elif (not st.is_alive()) and st.last_request and (now - st.last_request) < IDLE_TIMEOUT:
-                            await st.start()
+                        log.info(f"[Zamanlayıcı] {cid} yayını otomatik olarak DURDURULDU.")
+
+                if not st.enabled and st.is_alive():
+                    await st.stop()
+                elif st.is_alive() and st.last_request and (now - st.last_request) > IDLE_TIMEOUT:
+                    await st.stop()
+                elif (not st.is_alive()) and st.enabled and st.last_request and (now - st.last_request) < IDLE_TIMEOUT:
+                    await st.start()
 
 manager = StreamManager()
-
-
-async def save_channels_to_json():
-    """Tüm kanalların güncel durumunu JSON dosyasına yazar."""
-    try:
-        channels_data = []
-        for s in manager.streams.values():
-            s.ch["url"] = s.src
-            s.ch["enabled"] = s.enabled
-            s.ch["schedule"] = s.schedule
-            channels_data.append(s.ch)
-        with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
-            json.dump(channels_data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        log.error(f"Kanallar JSON dosyasına kaydedilemedi: {e}")
 
 
 # ==================== HTTP HANDLER'LAR ====================
@@ -562,10 +586,13 @@ async def handle_health(request):
     status = {
         "server": {
             "uptime_seconds": int(time.time() - APP_START_TIME),
+            "uptime_session_str": format_uptime(time.time() - APP_START_TIME),
+            "uptime_total_str": format_uptime(server_state.total_uptime_seconds),
             "ram_usage_mb": get_memory_usage_mb(),
             "total_served_mb": round(tracker.bytes_used / (1024 * 1024), 2),
             "total_served_gb": round(tracker.bytes_used / (1024 * 1024 * 1024), 3),
-            "total_viewers": manager.total_viewers()
+            "total_viewers": manager.total_viewers(),
+            "standby_message": server_state.standby_message
         },
         "channels": {}
     }
@@ -577,7 +604,10 @@ async def handle_health(request):
             "running": st.is_alive(),
             "ready": st.playlist_ready(),
             "viewers": st.get_viewer_count(),
-            "schedule": st.schedule
+            "sched_enabled": st.ch.get("sched_enabled", False),
+            "sched_days": st.ch.get("sched_days", []),
+            "sched_start": st.ch.get("sched_start", "00:00"),
+            "sched_end": st.ch.get("sched_end", "00:00")
         }
     return web.json_response(status, headers=NO_CACHE_HEADERS)
 
@@ -593,11 +623,12 @@ ADMIN_HTML = """
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; max-width: 650px; margin: auto; }
         .card { background: #1e293b; padding: 15px; border-radius: 12px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-        .stats-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 15px; }
+        .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 15px; }
         .stat-box { background: #334155; padding: 12px; border-radius: 8px; text-align: center; }
-        .stat-val { font-size: 20px; font-weight: bold; color: #38bdf8; }
+        .stat-val { font-size: 18px; font-weight: bold; color: #38bdf8; }
         .stat-lbl { font-size: 11px; color: #94a3b8; margin-top: 4px; }
         h2 { color: #38bdf8; margin-top: 0; }
+        h3 { margin: 0 0 5px 0; color: #f8fafc; }
         .btn { padding: 10px 18px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; color: white; transition: 0.2s; }
         .btn-on { background: #22c55e; }
         .btn-off { background: #ef4444; }
@@ -614,8 +645,18 @@ ADMIN_HTML = """
         .edit-input { flex: 1; padding: 8px 10px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #cbd5e1; font-size: 13px; }
         .btn-save { background: #3b82f6; font-size: 12px; padding: 6px 12px; }
         .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #16a34a; color: white; padding: 12px 24px; border-radius: 8px; z-index: 9999; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
-        .sched-item { display: flex; justify-content: space-between; align-items: center; background: #0f172a; padding: 5px 10px; border-radius: 6px; font-size: 12px; margin-bottom: 4px; }
-        .sched-del { color: #ef4444; cursor: pointer; font-weight: bold; padding: 0 4px; }
+        
+        .switch { position: relative; display: inline-block; width: 40px; height: 20px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #475569; transition: .3s; border-radius: 20px; }
+        .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background-color: white; transition: .3s; border-radius: 50%; }
+        input:checked + .slider { background-color: #22c55e; }
+        input:checked + .slider:before { transform: translateX(20px); }
+        
+        .sched-box { margin-top: 15px; background: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #334155; }
+        .days-container { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; margin-bottom: 8px; }
+        .days-container label { font-size: 11px; background: #334155; padding: 4px 6px; border-radius: 4px; cursor: pointer; display: flex; align-items: center; gap: 2px; }
+        .days-container input { margin: 0; }
     </style>
 </head>
 <body>
@@ -639,7 +680,7 @@ ADMIN_HTML = """
         
         <div class="stats-grid">
             <div class="stat-box">
-                <div class="stat-val" id="totalViewers" style="color:#a855f7;">0</div>
+                <div class="stat-val" id="totalViewers" style="color:#a855f7;">0 Kişi</div>
                 <div class="stat-lbl">Canlı İzleyici</div>
             </div>
             <div class="stat-box">
@@ -647,8 +688,22 @@ ADMIN_HTML = """
                 <div class="stat-lbl">Harcanan Kota (Aylık)</div>
             </div>
             <div class="stat-box">
+                <div class="stat-val" id="uptimeTotal" style="color:#22c55e;">0 Gün 0 Saat</div>
+                <div class="stat-lbl">Toplam Sunucu Uptime</div>
+            </div>
+            <div class="stat-box">
                 <div class="stat-val" id="ramMb">0 MB</div>
-                <div class="stat-lbl">RAM Kullanımı</div>
+                <div class="stat-lbl">RAM / Oturum Uptime</div>
+            </div>
+        </div>
+
+        <!-- YAYIN KAPALI MESAJ AYARI -->
+        <div class="card">
+            <h2 style="font-size:16px;">⚙️ Yayın Kapalı Ekran Mesajı</h2>
+            <p style="color:#94a3b8; font-size:11px; margin-top:-6px; margin-bottom:8px;">Yayın kapalıyken ekranda gösterilecek metni ayarlayın.</p>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+                <textarea id="standbyMessageInput" rows="2" class="edit-input" style="width:100%; padding:8px; border-radius:6px; resize: none;" placeholder="Yayın Kapalı Ekran Mesajı"></textarea>
+                <button class="btn btn-save" style="width:100%; padding:8px;" onclick="updateStandbyMessage()">Standby Ekran Mesajını Güncelle</button>
             </div>
         </div>
 
@@ -658,6 +713,7 @@ ADMIN_HTML = """
 
     <script>
         let updateInterval = null;
+        let standbyLoaded = false;
 
         function showToast(msg, color) {
             const t = document.getElementById('toastMsg');
@@ -723,7 +779,13 @@ ADMIN_HTML = """
                 
                 document.getElementById('totalViewers').innerText = data.server.total_viewers + " Kişi";
                 document.getElementById('servedGb').innerText = data.server.total_served_gb + " GB";
-                document.getElementById('ramMb').innerText = data.server.ram_usage_mb + " MB";
+                document.getElementById('uptimeTotal').innerText = data.server.uptime_total_str;
+                document.getElementById('ramMb').innerText = data.server.ram_usage_mb + " MB / " + data.server.uptime_session_str;
+
+                if (!standbyLoaded && data.server.standby_message) {
+                    document.getElementById('standbyMessageInput').value = data.server.standby_message;
+                    standbyLoaded = true;
+                }
 
                 const container = document.getElementById('channels');
 
@@ -738,13 +800,13 @@ ADMIN_HTML = """
 
                     const inputId = `url_${id}`;
                     const activeElement = document.activeElement;
-                    const isInputFocused = (activeElement && activeElement.id === inputId);
+                    const isInputFocused = (activeElement && (activeElement.id === inputId || activeElement.classList.contains(`sched-input-${id}`)));
 
                     if (!card.querySelector('.edit-input')) {
                         card.innerHTML = `
                             <div style="display:flex; justify-content:space-between; align-items:center;">
                                 <div>
-                                    <h3 style="margin:0 0 5px 0; color: #f8fafc;" class="channel-title">${info.name || id}</h3>
+                                    <h3 class="channel-title">${info.name || id}</h3>
                                     <div style="display:flex; gap: 5px; align-items:center; flex-wrap: wrap; margin-bottom: 6px;">
                                         <span class="status-badge badge-state ${info.enabled ? 'badge-active' : 'badge-disabled'}">
                                             ${info.enabled ? 'YAYINDA' : 'KAPALI'}
@@ -767,27 +829,49 @@ ADMIN_HTML = """
                                 <button class="btn btn-save" onclick="updateChannelUrl('${id}')">Kaydet</button>
                             </div>
 
-                            <!-- ZAMANLAYICI ALANI -->
-                            <div class="schedule-section" style="margin-top: 15px; border-top: 1px dashed #475569; padding-top: 10px;">
-                                <h4 style="margin: 0 0 8px 0; color: #38bdf8; font-size: 13px;">📅 Otomatik Yayın Zamanlayıcı (Çoklu Giriş Destekler)</h4>
-                                <div id="sched_list_${id}" style="margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px;"></div>
-                                <div style="display:flex; gap: 5px; align-items:center; flex-wrap: wrap;">
-                                    <select id="sched_day_${id}" style="padding: 6px; border-radius: 6px; background:#0f172a; color:white; border:1px solid #475569; font-size: 12px;">
-                                        <option value="Pazartesi">Pazartesi</option>
-                                        <option value="Salı">Salı</option>
-                                        <option value="Çarşamba">Çarşamba</option>
-                                        <option value="Perşembe">Perşembe</option>
-                                        <option value="Cuma">Cuma</option>
-                                        <option value="Cumartesi">Cumartesi</option>
-                                        <option value="Pazar">Pazar</option>
-                                    </select>
-                                    <input type="text" id="sched_start_${id}" placeholder="19:00" style="width:45px; padding: 6px; border-radius: 6px; background:#0f172a; color:white; border:1px solid #475569; font-size: 12px; text-align:center;">
-                                    <span style="color:#94a3b8; font-size:11px;">ile</span>
-                                    <input type="text" id="sched_end_${id}" placeholder="21:30" style="width:45px; padding: 6px; border-radius: 6px; background:#0f172a; color:white; border:1px solid #475569; font-size: 12px; text-align:center;">
-                                    <button class="btn btn-save" style="padding: 6px 10px; background:#10b981;" onclick="addSchedule('${id}')">Zaman Ekle</button>
+                            <!-- OTO ZAMANLAYICI BÖLÜMÜ -->
+                            <div class="sched-box">
+                                <div style="display:flex; justify-content:space-between; align-items:center;">
+                                    <span style="font-weight:bold; font-size:12px; color:#38bdf8;">⏰ Otomatik Zamanlayıcı (Aç / Kapat)</span>
+                                    <label class="switch">
+                                        <input type="checkbox" id="sched_enable_${id}" onchange="toggleScheduleUI('${id}')">
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <div id="sched_fields_${id}" style="display:none; flex-direction:column; margin-top:8px;">
+                                    <span style="font-size:11px; color:#94a3b8;">Aktif Günler:</span>
+                                    <div class="days-container">
+                                        <label><input type="checkbox" class="sched-day-${id}" value="0"> Pzt</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="1"> Sal</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="2"> Çar</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="3"> Per</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="4"> Cum</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="5"> Cmt</label>
+                                        <label><input type="checkbox" class="sched-day-${id}" value="6"> Paz</label>
+                                    </div>
+                                    <div style="display:flex; gap:10px; margin-bottom:10px;">
+                                        <div style="flex:1;">
+                                            <span style="font-size:11px; color:#94a3b8;">Açılış Saati:</span>
+                                            <input type="time" id="sched_start_${id}" class="edit-input sched-input-${id}" style="width:100%; margin-top:3px;">
+                                        </div>
+                                        <div style="flex:1;">
+                                            <span style="font-size:11px; color:#94a3b8;">Kapanış Saati:</span>
+                                            <input type="time" id="sched_end_${id}" class="edit-input sched-input-${id}" style="width:100%; margin-top:3px;">
+                                        </div>
+                                    </div>
+                                    <button class="btn btn-save" style="background:#059669; width:100%;" onclick="saveSchedule('${id}')">Zamanlayıcı Ayarlarını Kaydet</button>
                                 </div>
                             </div>
                         `;
+
+                        document.getElementById(`sched_enable_${id}`).checked = info.sched_enabled;
+                        document.getElementById(`sched_start_${id}`).value = info.sched_start;
+                        document.getElementById(`sched_end_${id}`).value = info.sched_end;
+                        info.sched_days.forEach(d => {
+                            const cb = card.querySelector(`.sched-day-${id}[value="${d}"]`);
+                            if (cb) cb.checked = true;
+                        });
+                        toggleScheduleUI(id);
                     } else {
                         card.querySelector('.channel-title').innerText = info.name || id;
                         
@@ -812,29 +896,68 @@ ADMIN_HTML = """
                             if (inp.value !== info.url) {
                                 inp.value = info.url;
                             }
-                        }
-                    }
-
-                    // Zamanlayıcı Listesini Çiz
-                    const listContainer = card.querySelector(`#sched_list_${id}`);
-                    if (listContainer) {
-                        let listHtml = "";
-                        if (info.schedule && info.schedule.length > 0) {
-                            info.schedule.forEach((item, index) => {
-                                listHtml += `
-                                    <div class="sched-item">
-                                        <span>🟢 <b>${item.day}</b>: ${item.start} - ${item.end}</span>
-                                        <span class="sched-del" onclick="deleteSchedule('${id}', ${index})">❌ Sil</span>
-                                    </div>
-                                `;
+                            
+                            document.getElementById(`sched_enable_${id}`).checked = info.sched_enabled;
+                            document.getElementById(`sched_start_${id}`).value = info.sched_start;
+                            document.getElementById(`sched_end_${id}`).value = info.sched_end;
+                            
+                            card.querySelectorAll(`.sched-day-${id}`).forEach(cb => {
+                                cb.checked = info.sched_days.includes(parseInt(cb.value));
                             });
-                        } else {
-                            listHtml = `<div style="color:#94a3b8; font-size:11px; font-style:italic;">Zamanlama ayarlanmamış. Yayın 7/24 veya manuel kontrol edilir.</div>`;
+                            toggleScheduleUI(id);
                         }
-                        listContainer.innerHTML = listHtml;
                     }
                 }
             } catch(e) {}
+        }
+
+        function toggleScheduleUI(id) {
+            const enabled = document.getElementById(`sched_enable_${id}`).checked;
+            document.getElementById(`sched_fields_${id}`).style.display = enabled ? "flex" : "none";
+        }
+
+        async function saveSchedule(id) {
+            const key = getStoredKey();
+            const enabled = document.getElementById(`sched_enable_${id}`).checked;
+            const start = document.getElementById(`sched_start_${id}`).value;
+            const end = document.getElementById(`sched_end_${id}`).value;
+            
+            const days = [];
+            document.querySelectorAll(`.sched-day-${id}:checked`).forEach(cb => {
+                days.push(cb.value);
+            });
+
+            try {
+                const res = await fetch(`/admin/update_schedule?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&enabled=${enabled}&days=${days.join(",")}&start=${start}&end=${end}&_=${Date.now()}`, { cache: 'no-store' });
+                if (res.ok) {
+                    showToast('✅ Zamanlayıcı ayarları başarıyla kaydedildi!');
+                    setTimeout(loadStatus, 500);
+                } else {
+                    showToast('❌ Ayarlar kaydedilemedi!', '#dc2626');
+                }
+            } catch(e) {
+                showToast('❌ Bağlantı hatası: ' + e.message, '#dc2626');
+            }
+        }
+
+        async function updateStandbyMessage() {
+            const key = getStoredKey();
+            const message = document.getElementById('standbyMessageInput').value.trim();
+            if(!message) {
+                showToast("Lütfen geçerli bir mesaj girin!", "#dc2626");
+                return;
+            }
+
+            try {
+                const res = await fetch(`/admin/update_standby?key=${encodeURIComponent(key)}&message=${encodeURIComponent(message)}&_=${Date.now()}`, { cache: 'no-store' });
+                if (res.ok) {
+                    showToast('✅ Standby ekran mesajı güncellendi ve yeniden oluşturuldu!');
+                } else {
+                    showToast('❌ Güncelleme başarısız oldu!', '#dc2626');
+                }
+            } catch(e) {
+                showToast('❌ Bağlantı hatası: ' + e.message, '#dc2626');
+            }
         }
 
         async function toggleChannel(id, enable) {
@@ -874,50 +997,6 @@ ADMIN_HTML = """
             }
         }
 
-        async function addSchedule(id) {
-            const key = getStoredKey();
-            const day = document.getElementById(`sched_day_${id}`).value;
-            const start = document.getElementById(`sched_start_${id}`).value.trim();
-            const end = document.getElementById(`sched_end_${id}`).value.trim();
-
-            const timeRegex = /^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$/;
-            if (!timeRegex.test(start) || !timeRegex.test(end)) {
-                showToast("❌ Saat formatı SS:DD (örn: 19:30) olmalıdır!", "#dc2626");
-                return;
-            }
-
-            try {
-                const res = await fetch(`/admin/add_schedule?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&day=${encodeURIComponent(day)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&_=${Date.now()}`, { cache: 'no-store' });
-                if (res.ok) {
-                    showToast("✅ Zamanlama başarıyla eklendi!");
-                    document.getElementById(`sched_start_${id}`).value = "";
-                    document.getElementById(`sched_end_${id}`).value = "";
-                    setTimeout(loadStatus, 500);
-                } else {
-                    const txt = await res.text();
-                    showToast("❌ Hata: " + txt, "#dc2626");
-                }
-            } catch (e) {
-                showToast("❌ Bağlantı hatası: " + e.message, "#dc2626");
-            }
-        }
-
-        async function deleteSchedule(id, index) {
-            if (!confirm("Bu zamanlamayı silmek istediğinize emin misiniz?")) return;
-            const key = getStoredKey();
-            try {
-                const res = await fetch(`/admin/delete_schedule?key=${encodeURIComponent(key)}&id=${encodeURIComponent(id)}&index=${index}&_=${Date.now()}`, { cache: 'no-store' });
-                if (res.ok) {
-                    showToast("✅ Zamanlama silindi!");
-                    setTimeout(loadStatus, 500);
-                } else {
-                    showToast("❌ Silme işlemi başarısız!", "#dc2626");
-                }
-            } catch (e) {
-                showToast("❌ Bağlantı hatası: " + e.message, "#dc2626");
-            }
-        }
-
         async function init() {
             const storedKey = getStoredKey();
             if (storedKey) {
@@ -940,7 +1019,6 @@ async def handle_admin_page(request):
     return web.Response(text=ADMIN_HTML, content_type="text/html")
 
 async def handle_admin_verify(request):
-    """Giriş şifresinin doğruluğunu kontrol eden endpoint"""
     key = request.query.get("key")
     if key == ADMIN_KEY:
         return web.json_response({"valid": True}, headers=NO_CACHE_HEADERS)
@@ -959,7 +1037,14 @@ async def handle_admin_toggle(request):
         return web.Response(status=404, text="Kanal Bulunamadı")
 
     st.enabled = enable
-    await save_channels_to_json()
+    st.ch["enabled"] = enable
+
+    try:
+        channels_data = [s.ch for s in manager.streams.values()]
+        with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(channels_data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log.warning(f"Kanal durumu diske kaydedilemedi: {e}")
 
     if not enable:
         await st.stop()
@@ -971,7 +1056,6 @@ async def handle_admin_toggle(request):
     return web.json_response({"success": True, "id": cid, "enabled": st.enabled}, headers=NO_CACHE_HEADERS)
 
 async def handle_admin_update_url(request):
-    """Admin panelinden gelen yeni yayın URL'sini kaydeder"""
     key = request.query.get("key")
     cid = request.query.get("id")
     new_url = request.query.get("url")
@@ -993,17 +1077,32 @@ async def handle_admin_update_url(request):
     return web.json_response({
         "success": True, 
         "id": cid, 
-        "url": st.src  
+        "url": st.src
     }, headers=NO_CACHE_HEADERS)
 
+async def handle_admin_update_standby(request):
+    key = request.query.get("key")
+    message = request.query.get("message")
 
-async def handle_admin_add_schedule(request):
-    """Kanala yeni bir otomatik zaman dilimi ekler"""
+    if key != ADMIN_KEY:
+        return web.Response(status=401, text="Yetkisiz Erişim")
+
+    if message is None:
+        return web.Response(status=400, text="Geçersiz Mesaj")
+
+    server_state.standby_message = message
+    server_state.save()
+    generate_standby_clip(force=True)
+
+    return web.json_response({"success": True, "message": message}, headers=NO_CACHE_HEADERS)
+
+async def handle_admin_update_schedule(request):
     key = request.query.get("key")
     cid = request.query.get("id")
-    day = request.query.get("day")
-    start = request.query.get("start")
-    end = request.query.get("end")
+    enabled = request.query.get("enabled") == "true"
+    days_str = request.query.get("days", "")
+    start = request.query.get("start", "00:00")
+    end = request.query.get("end", "00:00")
 
     if key != ADMIN_KEY:
         return web.Response(status=401, text="Yetkisiz Erişim")
@@ -1012,65 +1111,50 @@ async def handle_admin_add_schedule(request):
     if not st:
         return web.Response(status=404, text="Kanal Bulunamadı")
 
-    if not day or not start or not end:
-        return web.Response(status=400, text="Eksik Parametre")
-
-    time_re = re.compile(r"^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$")
-    if not time_re.match(start) or not time_re.match(end):
-        return web.Response(status=400, text="Geçersiz Saat Formatı (Örn: 19:00)")
-
-    normalized_day_str = normalize_day(day)
-    if normalized_day_str not in DAY_MAP:
-        return web.Response(status=400, text="Geçersiz Gün")
-
-    new_entry = {
-        "day": day.capitalize(),
-        "start": start,
-        "end": end
-    }
-    
-    st.schedule.append(new_entry)
-    await save_channels_to_json()
-    return web.json_response({"success": True, "schedule": st.schedule}, headers=NO_CACHE_HEADERS)
-
-
-async def handle_admin_delete_schedule(request):
-    """Kanaldaki kayıtlı bir zaman dilimini siler"""
-    key = request.query.get("key")
-    cid = request.query.get("id")
     try:
-        index = int(request.query.get("index", -1))
+        days_list = [int(d) for d in days_str.split(",") if d.strip() != ""]
     except ValueError:
-        return web.Response(status=400, text="Geçersiz İndeks")
+        days_list = []
 
-    if key != ADMIN_KEY:
-        return web.Response(status=401, text="Yetkisiz Erişim")
+    st.ch["sched_enabled"] = enabled
+    st.ch["sched_days"] = days_list
+    st.ch["sched_start"] = start
+    st.ch["sched_end"] = end
 
-    st = manager.get(cid)
-    if not st:
-        return web.Response(status=404, text="Kanal Bulunamadı")
+    try:
+        channels_data = [s.ch for s in manager.streams.values()]
+        with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(channels_data, f, indent=2, ensure_ascii=False)
+        log.info(f"Kanal zamanlayıcı ayarları kaydedildi: {cid}")
+    except Exception as e:
+        log.error(f"Zamanlayıcı ayarları kaydedilemedi: {e}")
 
-    if index < 0 or index >= len(st.schedule):
-        return web.Response(status=400, text="İndeks Limit Dışı")
+    sched_state = check_schedule(st)
+    if sched_state is not None:
+        st.enabled = sched_state
+        if sched_state and not st.is_alive():
+            await st.start()
+        elif not sched_state and st.is_alive():
+            await st.stop()
 
-    st.schedule.pop(index)
-    await save_channels_to_json()
-    return web.json_response({"success": True, "schedule": st.schedule}, headers=NO_CACHE_HEADERS)
+    return web.json_response({"success": True, "id": cid}, headers=NO_CACHE_HEADERS)
 
 
-# ==================== APP ====================
+# ==================== APP STARTUP & CLEANUP ====================
 async def on_startup(app):
     os.makedirs(HLS_BASE_DIR, exist_ok=True)
     generate_standby_clip()
     app["monitor_task"] = asyncio.create_task(manager.monitor())
     app["save_task"] = asyncio.create_task(tracker.periodic_save())
-    log.info("IPTV HLS Re-stream Proxy ve Otomatik Zamanlayıcı başarıyla başlatıldı.")
+    app["uptime_task"] = asyncio.create_task(uptime_tracker_task())
+    log.info("IPTV HLS Re-stream Proxy başlatıldı.")
 
 async def on_cleanup(app):
     tracker.save()
+    server_state.save()
     for st in manager.streams.values():
         await st.stop()
-    for task_name in ["monitor_task", "save_task"]:
+    for task_name in ["monitor_task", "save_task", "uptime_task"]:
         t = app.get(task_name)
         if t:
             t.cancel()
@@ -1083,8 +1167,8 @@ def make_app():
     app.router.add_get("/admin/verify", handle_admin_verify)
     app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/admin/update_url", handle_admin_update_url)
-    app.router.add_get("/admin/add_schedule", handle_admin_add_schedule)
-    app.router.add_get("/admin/delete_schedule", handle_admin_delete_schedule)
+    app.router.add_get("/admin/update_standby", handle_admin_update_standby)
+    app.router.add_get("/admin/update_schedule", handle_admin_update_schedule)
     app.router.add_get("/live/{channel_id}.m3u8", handle_m3u8)
     app.router.add_get("/hls/standby/seg.ts", handle_standby_segment)
     app.router.add_get("/hls/{channel_id}/{name}", handle_segment)
