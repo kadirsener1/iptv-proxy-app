@@ -5,6 +5,7 @@ FFmpeg tabanlı HLS re-stream proxy (Canlı İzleyici Sayacı & Kalıcı Aylık 
 Geliştirmeler: Kalıcı Toplam Uptime Takibi, Çoklu Kural Zamanlayıcı, Standby Mesajı & Ortam Değişkeni Güvenliği.
 Manuel + Zamanlayıcı birlikte çalışır: Zamanlayıcı kuralı aktifse kanal açık kalır (manuel kapatma geçersiz).
 Buton her zaman EFEKTİF duruma göre çalışır.
+GÜVENLİK: /health public endpoint URL'leri MASKELİ döner. /admin/channels admin key ile AÇIK URL döner.
 """
 
 import os
@@ -17,6 +18,7 @@ import subprocess
 import logging
 import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from aiohttp import web
 
 # ==================== AYARLAR & GÜVENLİK ====================
@@ -37,7 +39,7 @@ STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 # --- BUFFER AYARLARI (Yüksek Buffer) ---
 HLS_TIME       = 4
 HLS_LIST_SIZE  = 30       # 12 -> 30 (~120 sn buffer)
-HLS_INIT_TIME  = 3        # İlk segment daha hızlı
+HLS_INIT_TIME  = 2        # İlk segment daha hızlı
 IDLE_TIMEOUT   = 100
 STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
@@ -280,6 +282,19 @@ def get_turkey_now() -> datetime.datetime:
         return datetime.datetime.now(zoneinfo.ZoneInfo("Europe/Istanbul"))
     except Exception:
         return datetime.datetime.utcnow() + TURKEY_TZ_OFFSET
+
+
+def mask_url(url: str) -> str:
+    """URL'yi maskeler: protokol + host kalır, yol/token gizlenir.
+    Örn: http://nexttr.xyz:8080/live/AbdLk@16729@/V9qK3nRw52La/774257.m3u8
+       -> http://nexttr.xyz:8080/••••••"""
+    try:
+        p = urlparse(url)
+        if p.netloc:
+            return f"{p.scheme}://{p.netloc}/••••••"
+        return "••••••"
+    except Exception:
+        return "••••••"
 
 
 # ==================== STANDBY EKRANI ====================
@@ -531,7 +546,7 @@ class StreamManager:
             channels_data = [s.ch for s in self.streams.values()]
             with open(LOCAL_JSON_PATH, "w", encoding="utf-8") as f:
                 json.dump(channels_data, f, indent=2, ensure_ascii=False)
-            log.info(f"Kanal URL güncellendi: {cid} -> {new_url}")
+            log.info(f"Kanal URL güncellendi: {cid}")
         except Exception as e:
             log.error(f"Kanallar JSON dosyasına yazılamadı: {e}")
 
@@ -663,6 +678,7 @@ async def handle_standby_segment(request):
 
 
 async def handle_health(request):
+    """Public health endpoint. URL'ler MASKELİ döner."""
     now_tr = get_turkey_now()
     status = {
         "server": {
@@ -681,8 +697,8 @@ async def handle_health(request):
     }
     for cid, st in manager.streams.items():
         status["channels"][cid] = {
-            "name": st.ch.get("name", cid), 
-            "url": st.src,
+            "name": st.ch.get("name", cid),
+            "url": mask_url(st.src),   # <-- MASKELİ URL
             "enabled": st.enabled,
             "manual_enabled": st.manual_enabled,
             "sched_forced": manager.is_sched_forced(st),
@@ -696,6 +712,32 @@ async def handle_health(request):
             "sched_end": st.ch.get("sched_end", "00:00")
         }
     return web.json_response(status, headers=NO_CACHE_HEADERS)
+
+
+async def handle_admin_channels(request):
+    """Admin panel için kanal detayları (URL AÇIK). Sadece admin key ile erişilir."""
+    key = request.query.get("key")
+    if key != ADMIN_KEY:
+        return web.json_response({"success": False, "error": "Yetkisiz"}, status=401, headers=NO_CACHE_HEADERS)
+
+    channels = {}
+    for cid, st in manager.streams.items():
+        channels[cid] = {
+            "name": st.ch.get("name", cid),
+            "url": st.src,   # <-- AÇIK URL (sadece admin görür)
+            "enabled": st.enabled,
+            "manual_enabled": st.manual_enabled,
+            "sched_forced": manager.is_sched_forced(st),
+            "running": st.is_alive(),
+            "ready": st.playlist_ready(),
+            "viewers": st.get_viewer_count(),
+            "sched_enabled": st.ch.get("sched_enabled", False),
+            "sched_rules": st.ch.get("sched_rules", []),
+            "sched_days": st.ch.get("sched_days", []),
+            "sched_start": st.ch.get("sched_start", "00:00"),
+            "sched_end": st.ch.get("sched_end", "00:00")
+        }
+    return web.json_response({"channels": channels}, headers=NO_CACHE_HEADERS)
 
 
 # ==================== YÖNETİCİ PANELİ ====================
@@ -867,10 +909,29 @@ ADMIN_HTML = """
 
         async function loadStatus() {
             try {
-                const res = await fetch(`/health?_=${Date.now()}`, { cache: 'no-store' });
-                if (!res.ok) return;
-                const data = await res.json();
-                
+                const key = getStoredKey();
+                // İki endpoint paralel çağır: /health (genel) + /admin/channels (URL'ler açık)
+                const [healthRes, channelsRes] = await Promise.all([
+                    fetch(`/health?_=${Date.now()}`, { cache: 'no-store' }),
+                    fetch(`/admin/channels?key=${encodeURIComponent(key)}&_=${Date.now()}`, { cache: 'no-store' })
+                ]);
+                if (!healthRes.ok) return;
+                const data = await healthRes.json();
+
+                // URL'leri admin endpoint'ten al (varsa) ve health datasına merge et
+                if (channelsRes.ok) {
+                    try {
+                        const j = await channelsRes.json();
+                        if (j.channels) {
+                            for (const [id, info] of Object.entries(j.channels)) {
+                                if (data.channels[id]) {
+                                    data.channels[id].url = info.url;
+                                }
+                            }
+                        }
+                    } catch(e) {}
+                }
+
                 document.getElementById('totalViewers').innerText = data.server.total_viewers + " Kişi";
                 document.getElementById('servedGb').innerText = data.server.total_served_gb + " GB";
                 document.getElementById('uptimeTotal').innerText = data.server.uptime_total_str;
@@ -954,7 +1015,6 @@ ADMIN_HTML = """
                         // --- Güncelleme ---
                         card.querySelector('.channel-title').innerText = info.name || id;
                         
-                        // Zamanlayıcı zorla mı açık tutuyor?
                         const schedForced = info.sched_forced === true;
 
                         const badgeState = card.querySelector('.badge-state');
@@ -1224,14 +1284,11 @@ async def handle_admin_toggle(request):
     if not st:
         return web.Response(status=404, text="Kanal Bulunamadı")
 
-    # Kullanıcının manuel kararını kaydet
     st.manual_enabled = enable
     st.ch["manual_enabled"] = enable
 
-    # Efektif durumu hesapla
     target = manager._compute_target_state(st)
 
-    # Kullanıcı KAPATMAK istedi ama zamanlayıcı zorla açıyorsa bildir
     sched_forced = False
     if not enable and manager.is_sched_forced(st):
         sched_forced = True
@@ -1403,6 +1460,7 @@ def make_app():
     app.router.add_get("/health", handle_health)
     app.router.add_get("/admin", handle_admin_page)
     app.router.add_get("/admin/verify", handle_admin_verify)
+    app.router.add_get("/admin/channels", handle_admin_channels)   # <-- YENİ: URL'ler açık (admin only)
     app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/admin/update_url", handle_admin_update_url)
     app.router.add_get("/admin/update_standby", handle_admin_update_standby)
