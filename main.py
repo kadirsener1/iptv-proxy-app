@@ -39,6 +39,9 @@ STARTUP_WAIT   = 60
 FFMPEG_BIN     = "ffmpeg"
 APP_START_TIME = time.time()
 
+# Standby üretim kilit mekanizması
+standby_lock = asyncio.Lock()
+
 
 # ==================== KALICI AYLIK KOTA TAKİPÇİSİ ====================
 class BandwidthTracker:
@@ -159,7 +162,6 @@ def format_uptime(seconds: float) -> str:
 
 
 # ==================== KANALLAR (GİZLİ ORTAM DEĞİŞKENLİ) ====================
-# Linkler Render.com Environment'tan çekilir, GitHub'da görünmez!
 DEFAULT_KANALLAR = [
     {
         "id": "futbol_tv",
@@ -190,7 +192,6 @@ def load_dynamic_channels():
         try:
             with open(LOCAL_JSON_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-                # Eksik kanal varsa ortam değişkenleriyle tamamla
                 saved_ids = {c["id"] for c in saved}
                 for def_ch in DEFAULT_KANALLAR:
                     if def_ch["id"] not in saved_ids:
@@ -252,36 +253,73 @@ def get_memory_usage_mb():
         return 0.0
 
 
-# ==================== STANDBY EKRANI ====================
-def generate_standby_clip(force=False):
-    if not force and os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
-        return
-    os.makedirs(HLS_BASE_DIR, exist_ok=True)
+# ==================== STANDBY EKRANI (GÜVENLİ ASENKRON SÜRÜM) ====================
+async def generate_standby_clip(force=False):
+    """Standby klibini asenkron ve kilitli mekanizmayla güvenli şekilde oluşturur/günceller."""
+    async with standby_lock:
+        if not force and os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
+            return True
 
-    text_file_path = os.path.join(HLS_BASE_DIR, "standby_text.txt")
-    try:
-        with open(text_file_path, "w", encoding="utf-8") as f:
-            f.write(server_state.standby_message)
-    except Exception as e:
-        log.warning(f"Standby metin dosyası yazılamadı: {e}")
+        os.makedirs(HLS_BASE_DIR, exist_ok=True)
 
-    text_file_path_ff = text_file_path.replace('\\', '/').replace(':', '\\:')
+        text_file_path = os.path.join(HLS_BASE_DIR, "standby_text.txt")
+        try:
+            with open(text_file_path, "w", encoding="utf-8") as f:
+                f.write(server_state.standby_message)
+        except Exception as e:
+            log.warning(f"Standby metin dosyası yazılamadı: {e}")
 
-    cmd = [
-        FFMPEG_BIN, "-y",
-        "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={HLS_TIME}:r=25",
-        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
-        "-t", str(HLS_TIME),
-        "-vf", f"drawtext=textfile='{text_file_path_ff}':fontcolor=white:fontsize=44:x=(w-text_w)/2:y=(h-text_h)/2",
-        "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-b:v", "35k",
-        "-c:a", "aac", "-b:a", "16k",
-        "-f", "mpegts", STANDBY_TS_PATH
-    ]
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-        log.info("Standby klibi başarıyla oluşturuldu/güncellendi.")
-    except Exception as e:
-        log.warning(f"Standby klibi oluşturulamadı: {e}")
+        text_file_path_ff = text_file_path.replace('\\', '/').replace(':', '\\:')
+
+        # Standart drawtext komutu (Yazı tipi desteği varsa çalışır)
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={HLS_TIME}:r=25",
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+            "-t", str(HLS_TIME),
+            "-vf", f"drawtext=textfile='{text_file_path_ff}':fontcolor=white:fontsize=44:x=(w-text_w)/2:y=(h-text_h)/2",
+            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-b:v", "35k",
+            "-c:a", "aac", "-b:a", "16k",
+            "-f", "mpegts", STANDBY_TS_PATH
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode == 0 and os.path.exists(STANDBY_TS_PATH) and os.path.getsize(STANDBY_TS_PATH) > 0:
+                log.info("Standby klibi başarıyla oluşturuldu/güncellendi.")
+                return True
+            else:
+                log.warning(f"Metin klibi üretilemedi (Hata kodu: {proc.returncode}). Fallback siyah ekran oluşturuluyor...")
+        except Exception as e:
+            log.warning(f"Yazılı Standby klibi oluşturulamadı, sistem yazı tipi eksik olabilir: {e}")
+
+        # FALLBACK: Eğer sistemde font yoksa, hata alıp çökmek yerine temiz bir yazısız siyah ekran üretir
+        fallback_cmd = [
+            FFMPEG_BIN, "-y",
+            "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={HLS_TIME}:r=25",
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+            "-t", str(HLS_TIME),
+            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-b:v", "35k",
+            "-c:a", "aac", "-b:a", "16k",
+            "-f", "mpegts", STANDBY_TS_PATH
+        ]
+        try:
+            proc_fb = await asyncio.create_subprocess_exec(
+                *fallback_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await asyncio.wait_for(proc_fb.communicate(), timeout=10)
+            if proc_fb.returncode == 0:
+                log.info("Yazısız Siyah Standby Ekranı başarıyla oluşturuldu (Sistem fallback).")
+                return True
+        except Exception as fb_err:
+            log.error(f"Siyah ekran dahi oluşturulamadı: {fb_err}")
+        return False
 
 
 # ==================== OTO-ZAMANLAYICI KONTROLÜ ====================
@@ -470,11 +508,13 @@ class StreamManager:
                 if sched_state is not None:
                     if sched_state and not st.enabled:
                         st.enabled = True
+                        st.ch["enabled"] = True
                         st.touch()
                         await st.start()
                         log.info(f"[Zamanlayıcı] {cid} yayını otomatik olarak BAŞLATILDI.")
                     elif not sched_state and st.enabled:
                         st.enabled = False
+                        st.ch["enabled"] = False
                         await st.stop()
                         log.info(f"[Zamanlayıcı] {cid} yayını otomatik olarak DURDURULDU.")
 
@@ -572,8 +612,8 @@ async def handle_segment(request):
 
 
 async def handle_standby_segment(request):
-    if not os.path.exists(STANDBY_TS_PATH):
-        generate_standby_clip()
+    if not os.path.exists(STANDBY_TS_PATH) or os.path.getsize(STANDBY_TS_PATH) == 0:
+        await generate_standby_clip()
     if not os.path.exists(STANDBY_TS_PATH):
         return web.Response(status=404, headers=CORS_HEADERS)
 
@@ -1092,7 +1132,7 @@ async def handle_admin_update_standby(request):
 
     server_state.standby_message = message
     server_state.save()
-    generate_standby_clip(force=True)
+    await generate_standby_clip(force=True)
 
     return web.json_response({"success": True, "message": message}, headers=NO_CACHE_HEADERS)
 
@@ -1132,6 +1172,7 @@ async def handle_admin_update_schedule(request):
     sched_state = check_schedule(st)
     if sched_state is not None:
         st.enabled = sched_state
+        st.ch["enabled"] = sched_state
         if sched_state and not st.is_alive():
             await st.start()
         elif not sched_state and st.is_alive():
@@ -1143,7 +1184,7 @@ async def handle_admin_update_schedule(request):
 # ==================== APP STARTUP & CLEANUP ====================
 async def on_startup(app):
     os.makedirs(HLS_BASE_DIR, exist_ok=True)
-    generate_standby_clip()
+    await generate_standby_clip()
     app["monitor_task"] = asyncio.create_task(manager.monitor())
     app["save_task"] = asyncio.create_task(tracker.periodic_save())
     app["uptime_task"] = asyncio.create_task(uptime_tracker_task())
