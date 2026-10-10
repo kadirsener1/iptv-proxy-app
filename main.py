@@ -38,9 +38,9 @@ STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 # --- BUFFER AYARLARI (Hızlı Açılma + Stabil Yayın) ---
 HLS_TIME       = 4          # 5 -> 4 (daha kısa segment = daha hızlı açılma)
 HLS_LIST_SIZE  = 20         # 12 -> 20 (~80 sn buffer = donmaya karşı geniş tampon)
-HLS_INIT_TIME  = 1          # İlk segment hızlı üretilsin
+HLS_INIT_TIME  = 2          # İlk segment hızlı üretilsin
 IDLE_TIMEOUT   = 100
-STARTUP_WAIT   = 90         # 60 -> 90 (yavaş kaynaklar için tolerans)
+STARTUP_WAIT   = 10         # 60 -> 90 (yavaş kaynaklar için tolerans)
 FFMPEG_BIN     = "ffmpeg"
 APP_START_TIME = time.time()
 
