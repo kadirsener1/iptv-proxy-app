@@ -404,7 +404,7 @@ class ChannelStream:
             "-probesize", "10000000",
             "-analyzeduration", "10000000",
             "-fflags", "+genpts+igndts+discardcorrupt",
-            "-max_delay", "5000000",
+            "-max_delay", "9000000",
             "-rw_timeout", "15000000",
             "-reconnect", "1", "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",
