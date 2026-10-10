@@ -35,12 +35,12 @@ STATE_FILE      = os.environ.get("STATE_FILE", str(BASE_DIR / "server_state.json
 HLS_BASE_DIR = "/tmp/iptv_hls"
 STANDBY_TS_PATH = os.path.join(HLS_BASE_DIR, "standby.ts")
 
-# --- BUFFER AYARLARI (Yüksek Buffer) ---
-HLS_TIME       = 5
-HLS_LIST_SIZE  = 12       # 12 -> 30 (~120 sn buffer)
-HLS_INIT_TIME  = 1        # İlk segment daha hızlı
+# --- BUFFER AYARLARI (Hızlı Açılma + Stabil Yayın) ---
+HLS_TIME       = 4          # 5 -> 4 (daha kısa segment = daha hızlı açılma)
+HLS_LIST_SIZE  = 20         # 12 -> 20 (~80 sn buffer = donmaya karşı geniş tampon)
+HLS_INIT_TIME  = 1          # İlk segment hızlı üretilsin
 IDLE_TIMEOUT   = 100
-STARTUP_WAIT   = 60
+STARTUP_WAIT   = 90         # 60 -> 90 (yavaş kaynaklar için tolerans)
 FFMPEG_BIN     = "ffmpeg"
 APP_START_TIME = time.time()
 
@@ -378,6 +378,8 @@ class ChannelStream:
         self.enabled = channel.get("enabled", True)
         self.manual_enabled = channel.get("manual_enabled", channel.get("enabled", True))
         self.viewers = {}
+        self._restart_count = 0
+        self._last_restart = 0.0
 
     def record_viewer(self, ip: str):
         if ip and ip != "unknown":
@@ -401,15 +403,29 @@ class ChannelStream:
 
         cmd = [
             FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-nostdin",
+            # --- Kaynak analizi ---
             "-probesize", "10000000",
             "-analyzeduration", "10000000",
-            "-fflags", "+genpts+igndts+discardcorrupt",
-            "-max_delay", "9000000",
+            # --- Hata toleransı (donma önleme) ---
+            "-fflags", "+genpts+igndts+discardcorrupt+nobuffer",
+            "-flags", "low_delay",
+            "-err_detect", "ignore_err",
+            "-avoid_negative_ts", "make_zero",
+            # --- Ağ ayarları ---
+            "-max_delay", "5000000",
             "-rw_timeout", "15000000",
             "-reconnect", "1", "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",
             "-user_agent", "VLC/3.0.18 LibVLC/3.0.18",
-            "-i", self.src, "-c", "copy", "-f", "hls",
+            # --- Girdi ---
+            "-i", self.src,
+            # --- Çıktı (codec kopyalama, re-encode yok) ---
+            "-c", "copy",
+            "-map", "0:v?", "-map", "0:a?",
+            "-max_interleave_delta", "0",
+            "-mpegts_flags", "+resend_headers",
+            # --- HLS ayarları ---
+            "-f", "hls",
             "-hls_time", str(HLS_TIME),
             "-hls_list_size", str(HLS_LIST_SIZE),
             "-hls_init_time", str(HLS_INIT_TIME),
@@ -417,6 +433,7 @@ class ChannelStream:
             "-hls_segment_type", "mpegts",
             "-hls_segment_filename", seg_pattern,
             "-hls_allow_cache", "1",
+            "-hls_start_number_source", "epoch",
             m3u8_path
         ]
         return cmd
@@ -432,6 +449,9 @@ class ChannelStream:
             ff_log = open(os.path.join(LOG_DIR, f"{self.id}.ffmpeg.log"), "ab")
             self.proc = subprocess.Popen(cmd, stdout=ff_log, stderr=ff_log, stdin=subprocess.DEVNULL, start_new_session=True)
             self.started_at = time.time()
+            self._restart_count += 1
+            self._last_restart = time.time()
+            log.info(f"[FFmpeg] {self.id} başlatıldı (PID: {self.proc.pid}, restart #{self._restart_count})")
 
     async def stop(self):
         async with self.lock:
@@ -447,6 +467,7 @@ class ChannelStream:
                 except Exception:
                     pass
             self.proc = None
+            log.info(f"[FFmpeg] {self.id} durduruldu.")
 
     def is_alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -461,7 +482,7 @@ class ChannelStream:
         try:
             with open(p, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
-            return content.count("#EXTINF") >= 2
+            return content.count("#EXTINF") >= 1
         except Exception:
             return False
 
@@ -514,8 +535,8 @@ class StreamManager:
         while waited < STARTUP_WAIT:
             if st.playlist_ready():
                 return st
-            await asyncio.sleep(0.5)
-            waited += 0.5
+            await asyncio.sleep(0.3)
+            waited += 0.3
             if not st.is_alive() and st.enabled:
                 await asyncio.sleep(0.5)
                 await st.start()
@@ -547,6 +568,7 @@ class StreamManager:
         return True
 
     async def monitor(self):
+        """Ana izleme döngüsü: zamanlayıcı, idle, crash kontrolü."""
         while True:
             await asyncio.sleep(5)
             now = time.time()
@@ -568,8 +590,12 @@ class StreamManager:
                     await st.stop()
                 elif st.is_alive() and st.last_request and (now - st.last_request) > IDLE_TIMEOUT:
                     await st.stop()
+                    log.info(f"[Idle] {cid} yayını durduruldu (izleyici yok).")
                 elif (not st.is_alive()) and st.enabled and st.last_request and (now - st.last_request) < IDLE_TIMEOUT:
-                    await st.start()
+                    # FFmpeg çöktüyse otomatik yeniden başlat
+                    if (now - st._last_restart) > 5:
+                        log.warning(f"[Crash Recovery] {cid} FFmpeg çökmüş, yeniden başlatılıyor...")
+                        await st.start()
 
 manager = StreamManager()
 
@@ -901,7 +927,6 @@ ADMIN_HTML = """
         async function loadStatus() {
             try {
                 const key = getStoredKey();
-                // İki endpoint paralel çağır: /health (genel) + /admin/channels (URL'ler açık)
                 const [healthRes, channelsRes] = await Promise.all([
                     fetch(`/health?_=${Date.now()}`, { cache: 'no-store' }),
                     fetch(`/admin/channels?key=${encodeURIComponent(key)}&_=${Date.now()}`, { cache: 'no-store' })
@@ -909,7 +934,6 @@ ADMIN_HTML = """
                 if (!healthRes.ok) return;
                 const data = await healthRes.json();
 
-                // URL'leri admin endpoint'ten al (varsa) ve health datasına merge et
                 if (channelsRes.ok) {
                     try {
                         const j = await channelsRes.json();
@@ -954,7 +978,6 @@ ADMIN_HTML = """
                     const inputId = `url_${id}`;
 
                     if (!card.querySelector('.edit-input')) {
-                        // İlk oluşturma — BUTON EFEKTİF DURUMA GÖRE (info.enabled)
                         card.innerHTML = `
                             <div style="display:flex; justify-content:space-between; align-items:center;">
                                 <div>
@@ -982,7 +1005,6 @@ ADMIN_HTML = """
                                 <button class="btn btn-save" onclick="updateChannelUrl('${id}')">Kaydet</button>
                             </div>
 
-                            <!-- OTO ZAMANLAYICI BÖLÜMÜ (Çoklu Kural) -->
                             <div class="sched-box">
                                 <div style="display:flex; justify-content:space-between; align-items:center;">
                                     <span style="font-weight:bold; font-size:12px; color:#38bdf8;">⏰ Otomatik Zamanlayıcı (Çoklu Kural)</span>
@@ -1003,7 +1025,6 @@ ADMIN_HTML = """
                         renderScheduleRules(id, info.sched_rules || []);
                         toggleScheduleUI(id, true);
                     } else {
-                        // --- Güncelleme ---
                         card.querySelector('.channel-title').innerText = info.name || id;
                         
                         const schedForced = info.sched_forced === true;
@@ -1022,7 +1043,6 @@ ADMIN_HTML = """
                         badgeFfmpeg.className = `status-badge badge-ffmpeg ${info.running ? 'badge-ffmpeg-on' : 'badge-ffmpeg-off'}`;
                         badgeFfmpeg.innerText = info.running ? '● FFmpeg Aktif' : '○ FFmpeg Kapalı';
                         
-                        // === BUTON EFEKTİF DURUMA GÖRE (info.enabled) ===
                         const btnToggle = card.querySelector('.btn-toggle-action');
                         btnToggle.className = `btn btn-toggle-action ${info.enabled ? 'btn-off' : 'btn-on'}`;
                         btnToggle.innerText = info.enabled ? 'YAYINI KAPAT' : 'YAYINI AÇ';
@@ -1034,7 +1054,6 @@ ADMIN_HTML = """
                             inp.value = info.url;
                         }
 
-                        // --- ZAMANLAYICI UI GÜNCELLEMESİ ---
                         const schedEnableEl = document.getElementById(`sched_enable_${id}`);
 
                         const schedFocused = document.activeElement && (
@@ -1066,7 +1085,6 @@ ADMIN_HTML = """
             if (!silent) markSchedDirty(id);
         }
 
-        // --- ÇOKLU KURAL YÖNETİMİ ---
         function buildRuleHTML(chanId, ruleIdx, rule) {
             const days = ["Pzt","Sal","Çar","Per","Cum","Cmt","Paz"];
             let dayHTML = "";
@@ -1451,7 +1469,7 @@ def make_app():
     app.router.add_get("/health", handle_health)
     app.router.add_get("/admin", handle_admin_page)
     app.router.add_get("/admin/verify", handle_admin_verify)
-    app.router.add_get("/admin/channels", handle_admin_channels)   # <-- URL'ler açık (admin only)
+    app.router.add_get("/admin/channels", handle_admin_channels)
     app.router.add_get("/admin/toggle", handle_admin_toggle)
     app.router.add_get("/admin/update_url", handle_admin_update_url)
     app.router.add_get("/admin/update_standby", handle_admin_update_standby)
